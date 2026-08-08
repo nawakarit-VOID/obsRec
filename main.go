@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +14,11 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+const presetsPrefKey = "saved_times"
 
 type App struct {
 	fyneApp fyne.App
@@ -25,6 +29,7 @@ type App struct {
 	statusLabel *widget.Label
 	recordBtn   *widget.Button
 	stopBtn     *widget.Button
+	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
 
 	stopRequested chan struct{}
 	recording     bool
@@ -47,7 +52,7 @@ func main() {
 	}
 	myApp.buildUI()
 
-	w.Resize(fyne.NewSize(340, 200))
+	w.Resize(fyne.NewSize(360, 320))
 	w.ShowAndRun()
 }
 
@@ -62,15 +67,93 @@ func (a *App) buildUI() {
 	a.stopBtn = widget.NewButton("หยุดเอง", a.onStopPressed)
 	a.stopBtn.Disable()
 
+	saveBtn := widget.NewButtonWithIcon("บันทึกเวลานี้", theme.ContentAddIcon(), a.onSavePresetPressed)
+
+	a.presetsBox = container.NewGridWrap(fyne.NewSize(90, 36))
+
 	content := container.NewVBox(
 		widget.NewLabel("เวลาโดยประมาณ (mm:ss):"),
 		a.timeEntry,
+		saveBtn,
+		widget.NewLabel("เวลาที่บันทึกไว้:"),
+		a.presetsBox,
+		widget.NewSeparator(),
 		container.NewHBox(a.recordBtn, a.stopBtn),
 		widget.NewSeparator(),
 		a.statusLabel,
 	)
 	a.window.SetContent(content)
+
+	a.refreshPresets()
 }
+
+// ==== Preset เวลา ====
+
+func (a *App) loadPresets() []string {
+	return a.fyneApp.Preferences().StringList(presetsPrefKey)
+}
+
+func (a *App) savePresetsList(presets []string) {
+	a.fyneApp.Preferences().SetStringList(presetsPrefKey, presets)
+}
+
+func (a *App) onSavePresetPressed() {
+	text := strings.TrimSpace(a.timeEntry.Text)
+	if _, err := parseMMSS(text); err != nil {
+		dialog.ShowError(fmt.Errorf("กรอกเวลาในรูปแบบ mm:ss ก่อนบันทึก: %w", err), a.window)
+		return
+	}
+
+	presets := a.loadPresets()
+	for _, p := range presets {
+		if p == text {
+			// มีอยู่แล้ว ไม่ต้องเพิ่มซ้ำ
+			return
+		}
+	}
+	presets = append(presets, text)
+	sort.Slice(presets, func(i, j int) bool {
+		di, _ := parseMMSS(presets[i])
+		dj, _ := parseMMSS(presets[j])
+		return di < dj
+	})
+	a.savePresetsList(presets)
+	a.refreshPresets()
+}
+
+func (a *App) deletePreset(value string) {
+	presets := a.loadPresets()
+	out := make([]string, 0, len(presets))
+	for _, p := range presets {
+		if p != value {
+			out = append(out, p)
+		}
+	}
+	a.savePresetsList(out)
+	a.refreshPresets()
+}
+
+// refreshPresets สร้างปุ่ม preset ใหม่ทั้งหมดตาม list ปัจจุบัน แต่ละอันมีปุ่มลบ (x) กำกับ
+func (a *App) refreshPresets() {
+	presets := a.loadPresets()
+	a.presetsBox.Objects = nil
+
+	for _, p := range presets {
+		value := p // capture ไว้ใช้ใน closure
+		applyBtn := widget.NewButton(value, func() {
+			a.timeEntry.SetText(value)
+		})
+		delBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+			a.deletePreset(value)
+		})
+		delBtn.Importance = widget.LowImportance
+		row := container.NewBorder(nil, nil, nil, delBtn, applyBtn)
+		a.presetsBox.Add(row)
+	}
+	a.presetsBox.Refresh()
+}
+
+// ==== Recording flow ====
 
 func (a *App) setStatus(s string) {
 	fyne.Do(func() {
