@@ -36,7 +36,7 @@ type App struct {
 }
 
 func main() {
-	a := app.New()
+	a := app.NewWithID("com.pip-recorder.app")
 	w := a.NewWindow("PiP Recorder")
 
 	obs, err := NewOBSController(obsHost, obsPassword)
