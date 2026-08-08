@@ -4,7 +4,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,20 +16,11 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-type RecordMode string
-
-const (
-	ModeTimerOnly      RecordMode = "timer"
-	ModeTimerPlusAudio RecordMode = "timer_audio"
-	prefKeyLastMode               = "last_mode"
-)
-
 type App struct {
 	fyneApp fyne.App
 	window  fyne.Window
 	obs     *OBSController
 
-	modeSelect  *widget.RadioGroup
 	timeEntry   *widget.Entry
 	statusLabel *widget.Label
 	recordBtn   *widget.Button
@@ -57,23 +47,11 @@ func main() {
 	}
 	myApp.buildUI()
 
-	w.Resize(fyne.NewSize(360, 260))
+	w.Resize(fyne.NewSize(340, 200))
 	w.ShowAndRun()
 }
 
 func (a *App) buildUI() {
-	lastMode := a.fyneApp.Preferences().StringWithFallback(prefKeyLastMode, string(ModeTimerPlusAudio))
-
-	a.modeSelect = widget.NewRadioGroup([]string{
-		"Timer เท่านั้น",
-		"Timer + ตรวจจับเสียง",
-	}, nil)
-	if lastMode == string(ModeTimerOnly) {
-		a.modeSelect.SetSelected("Timer เท่านั้น")
-	} else {
-		a.modeSelect.SetSelected("Timer + ตรวจจับเสียง")
-	}
-
 	a.timeEntry = widget.NewEntry()
 	a.timeEntry.SetPlaceHolder("mm:ss เช่น 10:30")
 
@@ -85,8 +63,6 @@ func (a *App) buildUI() {
 	a.stopBtn.Disable()
 
 	content := container.NewVBox(
-		widget.NewLabel("โหมด:"),
-		a.modeSelect,
 		widget.NewLabel("เวลาโดยประมาณ (mm:ss):"),
 		a.timeEntry,
 		container.NewHBox(a.recordBtn, a.stopBtn),
@@ -94,13 +70,6 @@ func (a *App) buildUI() {
 		a.statusLabel,
 	)
 	a.window.SetContent(content)
-}
-
-func (a *App) currentMode() RecordMode {
-	if a.modeSelect.Selected == "Timer เท่านั้น" {
-		return ModeTimerOnly
-	}
-	return ModeTimerPlusAudio
 }
 
 func (a *App) setStatus(s string) {
@@ -123,9 +92,6 @@ func (a *App) onRecordPressed() {
 		return
 	}
 
-	mode := a.currentMode()
-	a.fyneApp.Preferences().SetString(prefKeyLastMode, string(mode))
-
 	if err := a.obs.StartRecord(); err != nil {
 		dialog.ShowError(err, a.window)
 		return
@@ -137,7 +103,7 @@ func (a *App) onRecordPressed() {
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
 
-	go a.runRecordingFlow(mode, dur)
+	go a.runRecordingFlow(dur)
 }
 
 func (a *App) onStopPressed() {
@@ -147,21 +113,10 @@ func (a *App) onStopPressed() {
 	close(a.stopRequested)
 }
 
-// runRecordingFlow คือ state machine หลัก รันใน goroutine แยก
-func (a *App) runRecordingFlow(mode RecordMode, timerDur time.Duration) {
-	// Phase 1: รอตาม timer ก่อนเสมอ ไม่สนใจเสียงระหว่างนี้
-	if !a.waitTimer(timerDur) {
-		return // ถูกสั่งหยุดเองระหว่าง timer
-	}
-
-	if mode == ModeTimerOnly {
+func (a *App) runRecordingFlow(timerDur time.Duration) {
+	if a.waitTimer(timerDur) {
 		a.finishRecording("ครบเวลาแล้ว หยุดอัดอัตโนมัติ")
-		return
 	}
-
-	// Phase 2: พ้น timer แล้ว เริ่มฟังเสียง
-	a.setStatus("พ้นเวลาขั้นต่ำแล้ว กำลังฟังเสียง...")
-	a.listenForSilenceLoop()
 }
 
 // waitTimer นับถอยหลัง คืนค่า true ถ้านับจนครบ, false ถ้าโดนสั่งหยุดเองก่อน
@@ -183,89 +138,11 @@ func (a *App) waitTimer(dur time.Duration) bool {
 	return true
 }
 
-// listenForSilenceLoop ฟังเสียงวนไป จนกว่าจะเจอเงียบแล้วคนไม่กดยกเลิก หรือกดหยุดเอง
-func (a *App) listenForSilenceLoop() {
-	for {
-		silenceCh := make(chan struct{}, 1)
-		monitorCtx, cancelMonitor := context.WithCancel(context.Background())
-
-		mon := NewAudioMonitor(audioMonitorSource, silenceAmplitudeThreshold, silenceDurationToTrigger)
-		go func() {
-			_ = mon.Start(monitorCtx, func() {
-				select {
-				case silenceCh <- struct{}{}:
-				default:
-				}
-			})
-		}()
-
-		select {
-		case <-a.stopRequested:
-			cancelMonitor()
-			a.finishRecording("หยุดอัดด้วยตนเอง")
-			return
-
-		case <-silenceCh:
-			cancelMonitor()
-			cancelled := a.showSilenceCountdown(stopCountdownDuration)
-			if cancelled {
-				a.setStatus("ยกเลิกแล้ว กำลังฟังเสียงต่อ...")
-				continue // วนฟังเสียงใหม่
-			}
-			a.finishRecording("ตรวจพบเงียบ หยุดอัดอัตโนมัติ")
-			return
-		}
-	}
-}
-
-// showSilenceCountdown แสดง dialog นับถอยหลัง คืนค่า true ถ้าคนกดยกเลิก (ยังไม่จบ)
-// false ถ้าปล่อยให้นับจนครบ (ให้หยุดอัดจริง)
-func (a *App) showSilenceCountdown(d time.Duration) bool {
-	resultCh := make(chan bool, 1)
-
-	fyne.Do(func() {
-		remaining := int(d.Seconds())
-		msg := widget.NewLabel(fmt.Sprintf("ตรวจพบเสียงเงียบ จะหยุดอัดใน %d วินาที", remaining))
-
-		var dlg dialog.Dialog
-		cancelled := false
-
-		confirmBtn := widget.NewButton("ยังไม่จบ (ยกเลิก)", func() {
-			cancelled = true
-			dlg.Hide()
-		})
-
-		dlg = dialog.NewCustomWithoutButtons("ตรวจพบความเงียบ", container.NewVBox(msg, confirmBtn), a.window)
-		dlg.SetOnClosed(func() {
-			resultCh <- cancelled
-		})
-		dlg.Show()
-
-		go func() {
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			left := remaining
-			for left > 0 {
-				<-ticker.C
-				left--
-				l := left
-				fyne.Do(func() {
-					msg.SetText(fmt.Sprintf("ตรวจพบเสียงเงียบ จะหยุดอัดใน %d วินาที", l))
-				})
-			}
-			fyne.Do(func() {
-				dlg.Hide() // ครบเวลา ปิดเอง -> cancelled ยัง false อยู่ -> หยุดอัดจริง
-			})
-		}()
-	})
-
-	return <-resultCh
-}
-
 func (a *App) finishRecording(reason string) {
 	if a.obs != nil {
 		if err := a.obs.StopRecord(); err != nil {
 			a.setStatus(fmt.Sprintf("หยุดอัดผิดพลาด: %v", err))
+			return
 		}
 	}
 	a.recording = false
