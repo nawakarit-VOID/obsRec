@@ -30,6 +30,7 @@ type App struct {
 	fyneApp fyne.App
 	window  fyne.Window
 	obs     *OBSController
+	router  *AudioRouter
 
 	hostEntry     *widget.Entry
 	passwordEntry *widget.Entry
@@ -38,6 +39,7 @@ type App struct {
 
 	timeEntry   *widget.Entry
 	statusLabel *widget.Label
+	logBox      *widget.Entry
 	recordBtn   *widget.Button
 	stopBtn     *widget.Button
 	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
@@ -55,9 +57,10 @@ func main() {
 		window:  w,
 	}
 	myApp.buildUI()
+	myApp.router = NewAudioRouter(myApp.appendLog)
 	myApp.tryAutoConnect()
 
-	w.Resize(fyne.NewSize(380, 420))
+	w.Resize(fyne.NewSize(400, 560))
 	w.ShowAndRun()
 }
 
@@ -93,6 +96,10 @@ func (a *App) buildUI() {
 	a.statusLabel = widget.NewLabel("พร้อมทำงาน")
 	a.statusLabel.Wrapping = fyne.TextWrapWord
 
+	a.logBox = widget.NewMultiLineEntry()
+	a.logBox.Wrapping = fyne.TextWrapWord
+	a.logBox.SetMinRowsVisible(6)
+
 	a.recordBtn = widget.NewButton("Record", a.onRecordPressed)
 	a.stopBtn = widget.NewButton("หยุดเอง", a.onStopPressed)
 	a.stopBtn.Disable()
@@ -111,15 +118,24 @@ func (a *App) buildUI() {
 		a.presetsBox,
 		widget.NewSeparator(),
 		container.NewHBox(a.recordBtn, a.stopBtn),
-		widget.NewSeparator(),
 		a.statusLabel,
+		widget.NewLabel("Log (audio routing):"),
+		container.NewScroll(a.logBox),
 	)
 	a.window.SetContent(content)
 
 	a.refreshPresets()
 }
 
-// tryAutoConnect ลองเชื่อมต่อ OBS อัตโนมัติตอนเปิดแอพ ถ้ามี host/password บันทึกไว้แล้ว
+func (a *App) appendLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fyne.Do(func() {
+		a.logBox.SetText(a.logBox.Text + msg + "\n")
+	})
+}
+
+// ==== เชื่อมต่อ OBS ====
+
 func (a *App) tryAutoConnect() {
 	if strings.TrimSpace(a.hostEntry.Text) == "" {
 		return
@@ -181,7 +197,6 @@ func (a *App) onSavePresetPressed() {
 	presets := a.loadPresets()
 	for _, p := range presets {
 		if p == text {
-			// มีอยู่แล้ว ไม่ต้องเพิ่มซ้ำ
 			return
 		}
 	}
@@ -207,13 +222,12 @@ func (a *App) deletePreset(value string) {
 	a.refreshPresets()
 }
 
-// refreshPresets สร้างปุ่ม preset ใหม่ทั้งหมดตาม list ปัจจุบัน แต่ละอันมีปุ่มลบ (x) กำกับ
 func (a *App) refreshPresets() {
 	presets := a.loadPresets()
 	a.presetsBox.Objects = nil
 
 	for _, p := range presets {
-		value := p // capture ไว้ใช้ใน closure
+		value := p
 		applyBtn := widget.NewButton(value, func() {
 			a.timeEntry.SetText(value)
 		})
@@ -249,7 +263,13 @@ func (a *App) onRecordPressed() {
 		return
 	}
 
+	// เริ่ม audio routing ก่อน (เฝ้าหน้าต่าง PiP + ย้ายเสียงเข้า OBS sink อัตโนมัติ)
+	if err := a.router.Start(); err != nil {
+		a.appendLog("เริ่ม audio routing ไม่สำเร็จ: %v", err)
+	}
+
 	if err := a.obs.StartRecord(); err != nil {
+		a.router.Stop()
 		dialog.ShowError(err, a.window)
 		return
 	}
@@ -276,7 +296,6 @@ func (a *App) runRecordingFlow(timerDur time.Duration) {
 	}
 }
 
-// waitTimer นับถอยหลัง คืนค่า true ถ้านับจนครบ, false ถ้าโดนสั่งหยุดเองก่อน
 func (a *App) waitTimer(dur time.Duration) bool {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -299,9 +318,11 @@ func (a *App) finishRecording(reason string) {
 	if a.obs != nil {
 		if err := a.obs.StopRecord(); err != nil {
 			a.setStatus(fmt.Sprintf("หยุดอัดผิดพลาด: %v", err))
-			return
 		}
 	}
+	// ย้าย audio stream กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
+	a.router.Stop()
+
 	a.recording = false
 	fyne.Do(func() {
 		a.recordBtn.Enable()
