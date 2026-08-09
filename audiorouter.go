@@ -22,6 +22,7 @@ type SinkInput struct {
 	ID        int
 	ProcessID int
 	AppName   string
+	Corked    bool // true = หยุดเล่นชั่วคราว (paused/ไม่มีเสียงออกตอนนี้)
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -87,6 +88,7 @@ func findPiPWindowPID() (int, bool, error) {
 var sinkInputHeaderRe = regexp.MustCompile(`(?m)^Sink Input #(\d+)`)
 var processIDRe = regexp.MustCompile(`application\.process\.id = "(\d+)"`)
 var appNameRe = regexp.MustCompile(`application\.name = "([^"]*)"`)
+var corkedRe = regexp.MustCompile(`Corked:\s*(yes|no)`)
 
 // listSinkInputs อ่าน audio stream ทั้งหมดที่กำลังเล่นอยู่ตอนนี้
 func listSinkInputs() ([]SinkInput, error) {
@@ -111,6 +113,9 @@ func listSinkInputs() ([]SinkInput, error) {
 		}
 		if am := appNameRe.FindStringSubmatch(block); am != nil {
 			si.AppName = am[1]
+		}
+		if cm := corkedRe.FindStringSubmatch(block); cm != nil {
+			si.Corked = cm[1] == "yes"
 		}
 		result = append(result, si)
 	}
@@ -229,30 +234,43 @@ func (r *AudioRouter) tick() {
 		return
 	}
 
-	// Fallback: ไม่เจอ process.id ตรงกันเป๊ะ (เช่น Firefox แยก process ต่อแท็บ)
-	// ลองจับ stream ของ Firefox ตัวล่าสุดที่ยังไม่ถูกย้ายแทน
-	var fallback *SinkInput
-	for i := range inputs {
-		si := &inputs[i]
+	// Fallback: ไม่เจอ process.id ตรงกันเป๊ะ (Firefox สมัยใหม่ PID ของหน้าต่าง PiP
+	// มักเป็น main process ไม่ใช่ content process ที่เล่นเสียงจริง เลย match ตรงๆ ไม่ค่อยติด)
+	//
+	// เกณฑ์ที่ใช้แทน: เอาเฉพาะ stream ของ Firefox ที่ "กำลังเล่นเสียงอยู่จริงตอนนี้"
+	// (Corked = no) และยังไม่เคยถูกย้าย ถ้าเจอตัวเดียวถือว่าใช่แน่ ย้ายเลย
+	// ถ้าเจอมากกว่า 1 ตัวพร้อมกัน (มีแท็บอื่นเล่นเสียงคาไว้ด้วย) จะไม่เดา แค่ log เตือนไว้
+	// กันย้ายผิดตัว รอบถัดไปค่อยลองใหม่
+	var candidates []SinkInput
+	for _, si := range inputs {
 		if !strings.Contains(strings.ToLower(si.AppName), "firefox") {
 			continue
+		}
+		if si.Corked {
+			continue // ไม่ได้เล่นเสียงอยู่ตอนนี้ ข้ามไป ไม่ใช่ตัวที่ต้องการแน่ๆ
 		}
 		r.mu.Lock()
 		already := r.routed[si.ID]
 		r.mu.Unlock()
 		if !already {
-			fallback = si
+			candidates = append(candidates, si)
 		}
 	}
-	if fallback == nil {
+
+	switch len(candidates) {
+	case 0:
 		return
+	case 1:
+		fallback := candidates[0]
+		if err := moveSinkInput(fallback.ID, sinkName); err != nil {
+			r.logf("ย้าย stream fallback ไม่สำเร็จ: %v", err)
+			return
+		}
+		r.mu.Lock()
+		r.routed[fallback.ID] = true
+		r.mu.Unlock()
+		r.logf("ไม่พบ PID ตรงกัน ใช้ fallback (เล่นอยู่จริง): ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
+	default:
+		r.logf("เจอ Firefox stream ที่กำลังเล่นอยู่หลายตัวพร้อมกัน (%d ตัว) ไม่แน่ใจว่าตัวไหนคือ PiP เลยข้ามรอบนี้ไปก่อน", len(candidates))
 	}
-	if err := moveSinkInput(fallback.ID, sinkName); err != nil {
-		r.logf("ย้าย stream fallback ไม่สำเร็จ: %v", err)
-		return
-	}
-	r.mu.Lock()
-	r.routed[fallback.ID] = true
-	r.mu.Unlock()
-	r.logf("ไม่พบ PID ตรงกัน ใช้ fallback: ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
 }
