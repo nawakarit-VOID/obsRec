@@ -18,12 +18,23 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-const presetsPrefKey = "saved_times"
+const (
+	presetsPrefKey  = "saved_times"
+	hostPrefKey     = "obs_host"
+	passwordPrefKey = "obs_password"
+
+	defaultOBSHost = "localhost:4455"
+)
 
 type App struct {
 	fyneApp fyne.App
 	window  fyne.Window
 	obs     *OBSController
+
+	hostEntry     *widget.Entry
+	passwordEntry *widget.Entry
+	connectBtn    *widget.Button
+	connStatus    *widget.Label
 
 	timeEntry   *widget.Entry
 	statusLabel *widget.Label
@@ -39,24 +50,43 @@ func main() {
 	a := app.NewWithID("com.pip-recorder.app")
 	w := a.NewWindow("PiP Recorder")
 
-	obs, err := NewOBSController(obsHost, obsPassword)
-	if err != nil {
-		// ยังเปิดหน้าต่างได้ แต่แจ้ง error ให้เห็น เผื่อ OBS ยังไม่เปิด/WebSocket ยังไม่ enable
-		dialog.ShowError(err, w)
-	}
-
 	myApp := &App{
 		fyneApp: a,
 		window:  w,
-		obs:     obs,
 	}
 	myApp.buildUI()
+	myApp.tryAutoConnect()
 
-	w.Resize(fyne.NewSize(360, 320))
+	w.Resize(fyne.NewSize(380, 420))
 	w.ShowAndRun()
 }
 
 func (a *App) buildUI() {
+	// ==== ส่วนเชื่อมต่อ OBS ====
+	savedHost := a.fyneApp.Preferences().StringWithFallback(hostPrefKey, defaultOBSHost)
+	savedPassword := a.fyneApp.Preferences().String(passwordPrefKey)
+
+	a.hostEntry = widget.NewEntry()
+	a.hostEntry.SetText(savedHost)
+	a.hostEntry.SetPlaceHolder("localhost:4455")
+
+	a.passwordEntry = widget.NewPasswordEntry()
+	a.passwordEntry.SetText(savedPassword)
+	a.passwordEntry.SetPlaceHolder("OBS WebSocket password")
+
+	a.connStatus = widget.NewLabel("ยังไม่ได้เชื่อมต่อ OBS")
+	a.connectBtn = widget.NewButton("เชื่อมต่อ OBS", a.onConnectPressed)
+
+	connBox := container.NewVBox(
+		widget.NewLabel("OBS Host:"),
+		a.hostEntry,
+		widget.NewLabel("OBS Password:"),
+		a.passwordEntry,
+		a.connectBtn,
+		a.connStatus,
+	)
+
+	// ==== ส่วนตั้งเวลา/บันทึก ====
 	a.timeEntry = widget.NewEntry()
 	a.timeEntry.SetPlaceHolder("mm:ss เช่น 10:30")
 
@@ -72,6 +102,8 @@ func (a *App) buildUI() {
 	a.presetsBox = container.NewGridWrap(fyne.NewSize(90, 36))
 
 	content := container.NewVBox(
+		connBox,
+		widget.NewSeparator(),
 		widget.NewLabel("เวลาโดยประมาณ (mm:ss):"),
 		a.timeEntry,
 		saveBtn,
@@ -85,6 +117,48 @@ func (a *App) buildUI() {
 	a.window.SetContent(content)
 
 	a.refreshPresets()
+}
+
+// tryAutoConnect ลองเชื่อมต่อ OBS อัตโนมัติตอนเปิดแอพ ถ้ามี host/password บันทึกไว้แล้ว
+func (a *App) tryAutoConnect() {
+	if strings.TrimSpace(a.hostEntry.Text) == "" {
+		return
+	}
+	a.connectToOBS()
+}
+
+func (a *App) onConnectPressed() {
+	a.connectToOBS()
+}
+
+func (a *App) connectToOBS() {
+	host := strings.TrimSpace(a.hostEntry.Text)
+	password := a.passwordEntry.Text
+
+	if host == "" {
+		dialog.ShowError(fmt.Errorf("กรอก OBS host ก่อน (เช่น localhost:4455)"), a.window)
+		return
+	}
+
+	if a.obs != nil {
+		a.obs.Close()
+		a.obs = nil
+	}
+
+	obs, err := NewOBSController(host, password)
+	if err != nil {
+		a.obs = nil
+		a.connStatus.SetText("เชื่อมต่อไม่สำเร็จ")
+		dialog.ShowError(err, a.window)
+		return
+	}
+
+	a.obs = obs
+	a.connStatus.SetText("เชื่อมต่อ OBS สำเร็จ (" + host + ")")
+
+	// เชื่อมต่อสำเร็จแล้วค่อยเซฟไว้ ครั้งหน้าจะได้ auto-connect ได้เลย
+	a.fyneApp.Preferences().SetString(hostPrefKey, host)
+	a.fyneApp.Preferences().SetString(passwordPrefKey, password)
 }
 
 // ==== Preset เวลา ====
@@ -171,7 +245,7 @@ func (a *App) onRecordPressed() {
 		return
 	}
 	if a.obs == nil {
-		dialog.ShowError(fmt.Errorf("ยังไม่ได้เชื่อมต่อ OBS สำเร็จ (เช็ค OBS เปิดอยู่มั้ย และ WebSocket enable แล้วมั้ย)"), a.window)
+		dialog.ShowError(fmt.Errorf("ยังไม่ได้เชื่อมต่อ OBS สำเร็จ (กด \"เชื่อมต่อ OBS\" ก่อน)"), a.window)
 		return
 	}
 
