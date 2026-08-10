@@ -22,7 +22,8 @@ type SinkInput struct {
 	ID        int
 	ProcessID int
 	AppName   string
-	Corked    bool // true = หยุดเล่นชั่วคราว (paused/ไม่มีเสียงออกตอนนี้)
+	MediaName string // มักเป็นชื่อหน้า/สื่อที่กำลังเล่น ช่วยให้คนแยกได้ว่าเป็นแท็บไหน
+	Corked    bool   // true = หยุดเล่นชั่วคราว (paused/ไม่มีเสียงออกตอนนี้)
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -88,6 +89,7 @@ func findPiPWindowPID() (int, bool, error) {
 var sinkInputHeaderRe = regexp.MustCompile(`(?m)^Sink Input #(\d+)`)
 var processIDRe = regexp.MustCompile(`application\.process\.id = "(\d+)"`)
 var appNameRe = regexp.MustCompile(`application\.name = "([^"]*)"`)
+var mediaNameRe = regexp.MustCompile(`media\.name = "([^"]*)"`)
 var corkedRe = regexp.MustCompile(`Corked:\s*(yes|no)`)
 
 // listSinkInputs อ่าน audio stream ทั้งหมดที่กำลังเล่นอยู่ตอนนี้
@@ -113,6 +115,9 @@ func listSinkInputs() ([]SinkInput, error) {
 		}
 		if am := appNameRe.FindStringSubmatch(block); am != nil {
 			si.AppName = am[1]
+		}
+		if mm := mediaNameRe.FindStringSubmatch(block); mm != nil {
+			si.MediaName = mm[1]
 		}
 		if cm := corkedRe.FindStringSubmatch(block); cm != nil {
 			si.Corked = cm[1] == "yes"
@@ -179,6 +184,51 @@ func (r *AudioRouter) Stop() {
 	r.mu.Unlock()
 }
 
+// ListPlayingFirefoxStreams คืนรายการ audio stream ของ Firefox ที่กำลังเล่นอยู่จริง
+// (ไม่ corked) และยังไม่เคยถูก route ไว้ก่อน ให้ UI เอาไปแสดงให้คนเลือกเอง
+func (r *AudioRouter) ListPlayingFirefoxStreams() ([]SinkInput, error) {
+	inputs, err := listSinkInputs()
+	if err != nil {
+		return nil, err
+	}
+	var result []SinkInput
+	for _, si := range inputs {
+		if !strings.Contains(strings.ToLower(si.AppName), "firefox") {
+			continue
+		}
+		if si.Corked {
+			continue
+		}
+		if r.IsRouted(si.ID) {
+			continue
+		}
+		result = append(result, si)
+	}
+	return result, nil
+}
+
+// IsRouted เช็คว่า sink-input id นี้ถูกย้ายเข้า OBS sink ไปแล้วหรือยัง
+func (r *AudioRouter) IsRouted(id int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.routed[id]
+}
+
+// RouteManually ย้าย sink-input ที่ระบุเข้า OBS sink ตามที่คนเลือกเองจาก UI
+func (r *AudioRouter) RouteManually(id int, label string) error {
+	if err := moveSinkInput(id, sinkName); err != nil {
+		return fmt.Errorf("ย้าย stream ไม่สำเร็จ: %w", err)
+	}
+	r.mu.Lock()
+	if r.routed == nil {
+		r.routed = make(map[int]bool)
+	}
+	r.routed[id] = true
+	r.mu.Unlock()
+	r.logf("เลือกเองจากรายการ: ย้าย stream #%d (%s) เข้า %s แล้ว", id, label, sinkName)
+	return nil
+}
+
 func (r *AudioRouter) watchLoop(ctx context.Context) {
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
@@ -234,43 +284,7 @@ func (r *AudioRouter) tick() {
 		return
 	}
 
-	// Fallback: ไม่เจอ process.id ตรงกันเป๊ะ (Firefox สมัยใหม่ PID ของหน้าต่าง PiP
-	// มักเป็น main process ไม่ใช่ content process ที่เล่นเสียงจริง เลย match ตรงๆ ไม่ค่อยติด)
-	//
-	// เกณฑ์ที่ใช้แทน: เอาเฉพาะ stream ของ Firefox ที่ "กำลังเล่นเสียงอยู่จริงตอนนี้"
-	// (Corked = no) และยังไม่เคยถูกย้าย ถ้าเจอตัวเดียวถือว่าใช่แน่ ย้ายเลย
-	// ถ้าเจอมากกว่า 1 ตัวพร้อมกัน (มีแท็บอื่นเล่นเสียงคาไว้ด้วย) จะไม่เดา แค่ log เตือนไว้
-	// กันย้ายผิดตัว รอบถัดไปค่อยลองใหม่
-	var candidates []SinkInput
-	for _, si := range inputs {
-		if !strings.Contains(strings.ToLower(si.AppName), "firefox") {
-			continue
-		}
-		if si.Corked {
-			continue // ไม่ได้เล่นเสียงอยู่ตอนนี้ ข้ามไป ไม่ใช่ตัวที่ต้องการแน่ๆ
-		}
-		r.mu.Lock()
-		already := r.routed[si.ID]
-		r.mu.Unlock()
-		if !already {
-			candidates = append(candidates, si)
-		}
-	}
-
-	switch len(candidates) {
-	case 0:
-		return
-	case 1:
-		fallback := candidates[0]
-		if err := moveSinkInput(fallback.ID, sinkName); err != nil {
-			r.logf("ย้าย stream fallback ไม่สำเร็จ: %v", err)
-			return
-		}
-		r.mu.Lock()
-		r.routed[fallback.ID] = true
-		r.mu.Unlock()
-		r.logf("ไม่พบ PID ตรงกัน ใช้ fallback (เล่นอยู่จริง): ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
-	default:
-		r.logf("เจอ Firefox stream ที่กำลังเล่นอยู่หลายตัวพร้อมกัน (%d ตัว) ไม่แน่ใจว่าตัวไหนคือ PiP เลยข้ามรอบนี้ไปก่อน", len(candidates))
-	}
+	// ไม่เจอ process.id ตรงกันเป๊ะ -> ไม่เดาต่อแล้ว (เดามั่วมาก่อนหน้านี้ทำให้ดึงเสียง
+	// จาก Firefox หน้าต่างอื่นมาผิดๆ) ปล่อยให้คนเลือกเองจากรายการ "เสียงที่กำลังเล่นอยู่"
+	// ในหน้า UI แทน ผ่าน RouteManually()
 }

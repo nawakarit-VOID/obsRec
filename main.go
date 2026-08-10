@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -43,9 +44,11 @@ type App struct {
 	recordBtn   *widget.Button
 	stopBtn     *widget.Button
 	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
+	streamsBox  *fyne.Container // รายการ audio stream ที่กำลังเล่น ให้เลือก route เอง
 
-	stopRequested chan struct{}
-	recording     bool
+	stopRequested    chan struct{}
+	streamListCancel context.CancelFunc
+	recording        bool
 }
 
 func main() {
@@ -107,6 +110,7 @@ func (a *App) buildUI() {
 	saveBtn := widget.NewButtonWithIcon("บันทึกเวลานี้", theme.ContentAddIcon(), a.onSavePresetPressed)
 
 	a.presetsBox = container.NewGridWrap(fyne.NewSize(90, 36))
+	a.streamsBox = container.NewVBox()
 
 	content := container.NewVBox(
 		connBox,
@@ -119,6 +123,10 @@ func (a *App) buildUI() {
 		widget.NewSeparator(),
 		container.NewHBox(a.recordBtn, a.stopBtn),
 		a.statusLabel,
+		widget.NewSeparator(),
+		widget.NewLabel("เสียงที่กำลังเล่นอยู่ (เลือกอันที่เป็น PiP):"),
+		a.streamsBox,
+		widget.NewSeparator(),
 		widget.NewLabel("Log (audio routing):"),
 		container.NewScroll(a.logBox),
 	)
@@ -241,6 +249,50 @@ func (a *App) refreshPresets() {
 	a.presetsBox.Refresh()
 }
 
+// streamListRefreshLoop อัปเดตรายการ "เสียงที่กำลังเล่นอยู่" ทุก 2 วิ ระหว่างอัด
+func (a *App) streamListRefreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.refreshStreamList()
+		}
+	}
+}
+
+func (a *App) refreshStreamList() {
+	streams, err := a.router.ListPlayingFirefoxStreams()
+	if err != nil {
+		a.appendLog("อ่านรายการ stream ไม่สำเร็จ: %v", err)
+		return
+	}
+	fyne.Do(func() {
+		a.streamsBox.Objects = nil
+		if len(streams) == 0 {
+			a.streamsBox.Add(widget.NewLabel("(ยังไม่พบเสียงที่กำลังเล่นอยู่)"))
+		}
+		for _, si := range streams {
+			si := si
+			label := si.MediaName
+			if label == "" {
+				label = si.AppName
+			}
+			btn := widget.NewButton(fmt.Sprintf("#%d  %s", si.ID, label), func() {
+				if err := a.router.RouteManually(si.ID, label); err != nil {
+					a.appendLog("เลือก stream ไม่สำเร็จ: %v", err)
+					return
+				}
+				a.refreshStreamList()
+			})
+			a.streamsBox.Add(btn)
+		}
+		a.streamsBox.Refresh()
+	})
+}
+
 // ==== Recording flow ====
 
 func (a *App) setStatus(s string) {
@@ -279,6 +331,10 @@ func (a *App) onRecordPressed() {
 	a.recordBtn.Disable()
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	a.streamListCancel = streamCancel
+	go a.streamListRefreshLoop(streamCtx)
 
 	go a.runRecordingFlow(dur)
 }
@@ -322,6 +378,15 @@ func (a *App) finishRecording(reason string) {
 	}
 	// ย้าย audio stream กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
 	a.router.Stop()
+
+	if a.streamListCancel != nil {
+		a.streamListCancel()
+		a.streamListCancel = nil
+	}
+	fyne.Do(func() {
+		a.streamsBox.Objects = nil
+		a.streamsBox.Refresh()
+	})
 
 	a.recording = false
 	fyne.Do(func() {
