@@ -4,7 +4,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -31,25 +30,22 @@ type App struct {
 	fyneApp fyne.App
 	window  fyne.Window
 	obs     *OBSController
-	router  *AudioRouter
 
 	hostEntry     *widget.Entry
 	passwordEntry *widget.Entry
 	connectBtn    *widget.Button
 	connStatus    *widget.Label
 
-	timeEntry    *widget.Entry
-	statusLabel  *widget.Label
-	logBox       *widget.Entry
-	recordBtn    *widget.Button
-	stopBtn      *widget.Button
-	presetsBox   *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
-	availableBox *fyne.Container // เสียงที่กำลังเล่น แต่ยังไม่เชื่อมกับ OBS
-	connectedBox *fyne.Container // เสียงที่เชื่อมกับ OBS แล้ว
+	timeEntry   *widget.Entry
+	statusLabel *widget.Label
+	logBox      *widget.Entry
+	recordBtn   *widget.Button
+	stopBtn     *widget.Button
+	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
+	sourcesBox  *fyne.Container // รายการ audio stream ทั้งหมด แบบ toggle ✅/⬜
 
-	stopRequested    chan struct{}
-	streamListCancel context.CancelFunc
-	recording        bool
+	stopRequested chan struct{}
+	recording     bool
 }
 
 func main() {
@@ -61,10 +57,9 @@ func main() {
 		window:  w,
 	}
 	myApp.buildUI()
-	myApp.router = NewAudioRouter(myApp.appendLog)
 	myApp.tryAutoConnect()
 
-	w.Resize(fyne.NewSize(400, 560))
+	w.Resize(fyne.NewSize(420, 620))
 	w.ShowAndRun()
 }
 
@@ -111,8 +106,12 @@ func (a *App) buildUI() {
 	saveBtn := widget.NewButtonWithIcon("บันทึกเวลานี้", theme.ContentAddIcon(), a.onSavePresetPressed)
 
 	a.presetsBox = container.NewGridWrap(fyne.NewSize(90, 36))
-	a.availableBox = container.NewVBox()
-	a.connectedBox = container.NewVBox()
+
+	// ==== ส่วน audio routing ====
+	a.sourcesBox = container.NewVBox()
+	scanBtn := widget.NewButton("สแกนแหล่งเสียง", a.scan)
+	autoBtn := widget.NewButton("เชื่อมอัตโนมัติจาก PiP", a.autoConnectFromPiP)
+	autoBtn.Importance = widget.HighImportance
 
 	content := container.NewVBox(
 		connBox,
@@ -126,12 +125,11 @@ func (a *App) buildUI() {
 		container.NewHBox(a.recordBtn, a.stopBtn),
 		a.statusLabel,
 		widget.NewSeparator(),
-		widget.NewLabel("ยังไม่เชื่อม (คลิกเพื่อเชื่อมกับ OBS):"),
-		a.availableBox,
-		widget.NewLabel("เชื่อมกับ OBS แล้ว (คลิกเพื่อยกเลิก):"),
-		a.connectedBox,
+		widget.NewLabel("Audio routing (คลิกที่ชิปเพื่อเชื่อม/ยกเลิก):"),
+		container.NewHBox(scanBtn, autoBtn),
+		a.sourcesBox,
 		widget.NewSeparator(),
-		widget.NewLabel("Log (audio routing):"),
+		widget.NewLabel("Log:"),
 		container.NewScroll(a.logBox),
 	)
 	a.window.SetContent(content)
@@ -253,67 +251,171 @@ func (a *App) refreshPresets() {
 	a.presetsBox.Refresh()
 }
 
-// streamListRefreshLoop อัปเดตรายการ "เสียงที่กำลังเล่นอยู่" ทุก 2 วิ ระหว่างอัด
-func (a *App) streamListRefreshLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			a.refreshStreamList()
+// ==== Audio routing ====
+
+// loadAudioState สร้าง sink ถ้ายังไม่มี แล้วดึงข้อมูล obsIndex + stream ทั้งหมด
+func (a *App) loadAudioState() (int, []SinkInput, error) {
+	if err := ensureSink(); err != nil {
+		return -1, nil, fmt.Errorf("สร้าง sink ไม่สำเร็จ: %w", err)
+	}
+	obsIndex, err := getSinkIndex(sinkName)
+	if err != nil {
+		return -1, nil, fmt.Errorf("หา sink ไม่เจอ: %w", err)
+	}
+	inputs, err := listSinkInputs()
+	if err != nil {
+		return -1, nil, fmt.Errorf("อ่าน audio stream ผิดพลาด: %w", err)
+	}
+	return obsIndex, inputs, nil
+}
+
+// renderSources สร้างปุ่ม toggle ให้แต่ละ stream ตามข้อมูลที่มี
+func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
+	fyne.Do(func() {
+		a.sourcesBox.Objects = nil
+		if len(inputs) == 0 {
+			a.sourcesBox.Add(widget.NewLabel("ไม่พบแหล่งเสียงที่กำลังเล่นอยู่ตอนนี้"))
 		}
+		for _, si := range inputs {
+			si := si // capture ตัวแปรสำหรับ closure
+			connected := si.SinkIndex == obsIndex
+			prefix := "⬜ "
+			importance := widget.MediumImportance
+			if connected {
+				prefix = "✅ "
+				importance = widget.SuccessImportance
+			}
+			btnLabel := fmt.Sprintf("%s%s (#%d)", prefix, si.DisplayLabel(), si.ID)
+
+			btn := widget.NewButton(btnLabel, nil)
+			btn.Importance = importance
+			btn.OnTapped = func() {
+				target := sinkName
+				if connected {
+					target = "@DEFAULT_SINK@"
+				}
+				if err := moveSinkInput(si.ID, target); err != nil {
+					a.appendLog("ย้าย stream #%d ไม่สำเร็จ: %v", si.ID, err)
+					return
+				}
+				a.scan()
+			}
+			a.sourcesBox.Add(btn)
+		}
+		a.sourcesBox.Refresh()
+	})
+}
+
+// scan ดึงรายชื่อ audio stream ทั้งหมดตอนนี้ แล้วสร้างปุ่ม toggle ให้แต่ละตัว
+func (a *App) scan() {
+	obsIndex, inputs, err := a.loadAudioState()
+	if err != nil {
+		a.appendLog("สแกนล้มเหลว: %v", err)
+		return
+	}
+	a.renderSources(obsIndex, inputs)
+	a.appendLog("สแกนแล้ว เจอ %d แหล่งเสียง", len(inputs))
+}
+
+// autoConnectFromPiP เช็คว่ามีหน้าต่าง Picture-in-Picture เปิดอยู่ไหม
+// ถ้ามี จะตัดการเชื่อมต่อเดิมทั้งหมด แล้วเชื่อมเฉพาะ stream ของแท็บนั้น
+// (แค่อันเดียว) เข้า OBS_Record ให้อัตโนมัติ
+func (a *App) autoConnectFromPiP() {
+	pid, found, err := findPiPWindowPID()
+	if err != nil {
+		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
+		return
+	}
+	if !found {
+		a.appendLog("ไม่พบหน้าต่าง Picture-in-Picture ที่เปิดอยู่ตอนนี้")
+		return
+	}
+
+	obsIndex, inputs, err := a.loadAudioState()
+	if err != nil {
+		a.appendLog("%v", err)
+		return
+	}
+
+	// ตัดการเชื่อมต่อเดิมทั้งหมดก่อน ให้เหลือแค่อันเดียวตามที่ต้องการ
+	for _, si := range inputs {
+		if si.SinkIndex == obsIndex {
+			_ = moveSinkInput(si.ID, "@DEFAULT_SINK@")
+		}
+	}
+
+	// ลอง match ด้วย PID ตรงๆ ก่อน (แม่นสุดถ้าตรง)
+	pidStr := strconv.Itoa(pid)
+	var target *SinkInput
+	for i := range inputs {
+		if inputs[i].Props["application.process.id"] == pidStr {
+			target = &inputs[i]
+			break
+		}
+	}
+
+	usedFallback := false
+	if target == nil {
+		usedFallback = true
+		for i := range inputs {
+			if !strings.Contains(strings.ToLower(inputs[i].Props["application.name"]), "firefox") {
+				continue
+			}
+			if target == nil || inputs[i].ID > target.ID {
+				target = &inputs[i]
+			}
+		}
+	}
+
+	if target == nil {
+		a.appendLog("เจอ PiP (pid=%d) แต่หา audio stream ของ Firefox ไม่เจอเลย", pid)
+		obsIndex2, inputs2, _ := a.loadAudioState()
+		a.renderSources(obsIndex2, inputs2)
+		return
+	}
+
+	if err := moveSinkInput(target.ID, sinkName); err != nil {
+		a.appendLog("เชื่อม stream #%d ไม่สำเร็จ: %v", target.ID, err)
+		return
+	}
+
+	obsIndex2, inputs2, err := a.loadAudioState()
+	if err == nil {
+		a.renderSources(obsIndex2, inputs2)
+	}
+
+	if usedFallback {
+		a.appendLog("⚠️ PID ไม่ตรงกัน (PiP pid=%d) ใช้ fallback เชื่อม stream ล่าสุดแทน: #%d — เช็คด้วยรายการด้านล่างว่าใช่ตัวที่ต้องการไหม", pid, target.ID)
+	} else {
+		a.appendLog("✅ เจอ PiP (pid=%d) ตรงกับ stream #%d เชื่อมเรียบร้อยแล้ว", pid, target.ID)
 	}
 }
 
-func (a *App) refreshStreamList() {
-	available, err := a.router.ListPlayingFirefoxStreams()
+// disconnectAllFromOBS ย้าย stream ที่เชื่อมกับ OBS อยู่ตอนนี้ทั้งหมดกลับ default sink
+func (a *App) disconnectAllFromOBS() {
+	obsIndex, inputs, err := a.loadAudioState()
 	if err != nil {
-		a.appendLog("อ่านรายการ stream ไม่สำเร็จ: %v", err)
+		a.appendLog("%v", err)
 		return
 	}
-	connected := a.router.ListRouted()
-
-	fyne.Do(func() {
-		a.availableBox.Objects = nil
-		if len(available) == 0 {
-			a.availableBox.Add(widget.NewLabel("(ยังไม่พบเสียงที่กำลังเล่นอยู่)"))
+	count := 0
+	for _, si := range inputs {
+		if si.SinkIndex != obsIndex {
+			continue
 		}
-		for _, si := range available {
-			si := si
-			label := si.MediaName
-			if label == "" {
-				label = si.AppName
-			}
-			btn := widget.NewButton(fmt.Sprintf("#%d  %s", si.ID, label), func() {
-				if err := a.router.RouteManually(si.ID, label); err != nil {
-					a.appendLog("เชื่อม stream ไม่สำเร็จ: %v", err)
-					return
-				}
-				a.refreshStreamList()
-			})
-			a.availableBox.Add(btn)
+		if err := moveSinkInput(si.ID, "@DEFAULT_SINK@"); err != nil {
+			a.appendLog("ย้าย stream #%d กลับไม่สำเร็จ: %v", si.ID, err)
+			continue
 		}
-		a.availableBox.Refresh()
-
-		a.connectedBox.Objects = nil
-		if len(connected) == 0 {
-			a.connectedBox.Add(widget.NewLabel("(ยังไม่มีอะไรเชื่อมอยู่)"))
-		}
-		for _, si := range connected {
-			si := si
-			btn := widget.NewButton(fmt.Sprintf("#%d  %s", si.ID, si.MediaName), func() {
-				if err := a.router.DisconnectOne(si.ID); err != nil {
-					a.appendLog("ยกเลิก stream ไม่สำเร็จ: %v", err)
-					return
-				}
-				a.refreshStreamList()
-			})
-			a.connectedBox.Add(btn)
-		}
-		a.connectedBox.Refresh()
-	})
+		count++
+	}
+	if count > 0 {
+		a.appendLog("ย้าย %d stream กลับ default sink แล้ว", count)
+	}
+	obsIndex2, inputs2, err := a.loadAudioState()
+	if err == nil {
+		a.renderSources(obsIndex2, inputs2)
+	}
 }
 
 // ==== Recording flow ====
@@ -338,13 +440,7 @@ func (a *App) onRecordPressed() {
 		return
 	}
 
-	// เริ่ม audio routing ก่อน (เฝ้าหน้าต่าง PiP + ย้ายเสียงเข้า OBS sink อัตโนมัติ)
-	if err := a.router.Start(); err != nil {
-		a.appendLog("เริ่ม audio routing ไม่สำเร็จ: %v", err)
-	}
-
 	if err := a.obs.StartRecord(); err != nil {
-		a.router.Stop()
 		dialog.ShowError(err, a.window)
 		return
 	}
@@ -354,10 +450,6 @@ func (a *App) onRecordPressed() {
 	a.recordBtn.Disable()
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
-
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	a.streamListCancel = streamCancel
-	go a.streamListRefreshLoop(streamCtx)
 
 	go a.runRecordingFlow(dur)
 }
@@ -399,19 +491,8 @@ func (a *App) finishRecording(reason string) {
 			a.setStatus(fmt.Sprintf("หยุดอัดผิดพลาด: %v", err))
 		}
 	}
-	// ย้าย audio stream กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
-	a.router.Stop()
-
-	if a.streamListCancel != nil {
-		a.streamListCancel()
-		a.streamListCancel = nil
-	}
-	fyne.Do(func() {
-		a.availableBox.Objects = nil
-		a.availableBox.Refresh()
-		a.connectedBox.Objects = nil
-		a.connectedBox.Refresh()
-	})
+	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
+	a.disconnectAllFromOBS()
 
 	a.recording = false
 	fyne.Do(func() {
