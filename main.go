@@ -38,13 +38,14 @@ type App struct {
 	connectBtn    *widget.Button
 	connStatus    *widget.Label
 
-	timeEntry   *widget.Entry
-	statusLabel *widget.Label
-	logBox      *widget.Entry
-	recordBtn   *widget.Button
-	stopBtn     *widget.Button
-	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
-	streamsBox  *fyne.Container // รายการ audio stream ที่กำลังเล่น ให้เลือก route เอง
+	timeEntry    *widget.Entry
+	statusLabel  *widget.Label
+	logBox       *widget.Entry
+	recordBtn    *widget.Button
+	stopBtn      *widget.Button
+	presetsBox   *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
+	availableBox *fyne.Container // เสียงที่กำลังเล่น แต่ยังไม่เชื่อมกับ OBS
+	connectedBox *fyne.Container // เสียงที่เชื่อมกับ OBS แล้ว
 
 	stopRequested    chan struct{}
 	streamListCancel context.CancelFunc
@@ -110,7 +111,8 @@ func (a *App) buildUI() {
 	saveBtn := widget.NewButtonWithIcon("บันทึกเวลานี้", theme.ContentAddIcon(), a.onSavePresetPressed)
 
 	a.presetsBox = container.NewGridWrap(fyne.NewSize(90, 36))
-	a.streamsBox = container.NewVBox()
+	a.availableBox = container.NewVBox()
+	a.connectedBox = container.NewVBox()
 
 	content := container.NewVBox(
 		connBox,
@@ -124,8 +126,10 @@ func (a *App) buildUI() {
 		container.NewHBox(a.recordBtn, a.stopBtn),
 		a.statusLabel,
 		widget.NewSeparator(),
-		widget.NewLabel("เสียงที่กำลังเล่นอยู่ (เลือกอันที่เป็น PiP):"),
-		a.streamsBox,
+		widget.NewLabel("ยังไม่เชื่อม (คลิกเพื่อเชื่อมกับ OBS):"),
+		a.availableBox,
+		widget.NewLabel("เชื่อมกับ OBS แล้ว (คลิกเพื่อยกเลิก):"),
+		a.connectedBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Log (audio routing):"),
 		container.NewScroll(a.logBox),
@@ -264,17 +268,19 @@ func (a *App) streamListRefreshLoop(ctx context.Context) {
 }
 
 func (a *App) refreshStreamList() {
-	streams, err := a.router.ListPlayingFirefoxStreams()
+	available, err := a.router.ListPlayingFirefoxStreams()
 	if err != nil {
 		a.appendLog("อ่านรายการ stream ไม่สำเร็จ: %v", err)
 		return
 	}
+	connected := a.router.ListRouted()
+
 	fyne.Do(func() {
-		a.streamsBox.Objects = nil
-		if len(streams) == 0 {
-			a.streamsBox.Add(widget.NewLabel("(ยังไม่พบเสียงที่กำลังเล่นอยู่)"))
+		a.availableBox.Objects = nil
+		if len(available) == 0 {
+			a.availableBox.Add(widget.NewLabel("(ยังไม่พบเสียงที่กำลังเล่นอยู่)"))
 		}
-		for _, si := range streams {
+		for _, si := range available {
 			si := si
 			label := si.MediaName
 			if label == "" {
@@ -282,14 +288,31 @@ func (a *App) refreshStreamList() {
 			}
 			btn := widget.NewButton(fmt.Sprintf("#%d  %s", si.ID, label), func() {
 				if err := a.router.RouteManually(si.ID, label); err != nil {
-					a.appendLog("เลือก stream ไม่สำเร็จ: %v", err)
+					a.appendLog("เชื่อม stream ไม่สำเร็จ: %v", err)
 					return
 				}
 				a.refreshStreamList()
 			})
-			a.streamsBox.Add(btn)
+			a.availableBox.Add(btn)
 		}
-		a.streamsBox.Refresh()
+		a.availableBox.Refresh()
+
+		a.connectedBox.Objects = nil
+		if len(connected) == 0 {
+			a.connectedBox.Add(widget.NewLabel("(ยังไม่มีอะไรเชื่อมอยู่)"))
+		}
+		for _, si := range connected {
+			si := si
+			btn := widget.NewButton(fmt.Sprintf("#%d  %s", si.ID, si.MediaName), func() {
+				if err := a.router.DisconnectOne(si.ID); err != nil {
+					a.appendLog("ยกเลิก stream ไม่สำเร็จ: %v", err)
+					return
+				}
+				a.refreshStreamList()
+			})
+			a.connectedBox.Add(btn)
+		}
+		a.connectedBox.Refresh()
 	})
 }
 
@@ -384,8 +407,10 @@ func (a *App) finishRecording(reason string) {
 		a.streamListCancel = nil
 	}
 	fyne.Do(func() {
-		a.streamsBox.Objects = nil
-		a.streamsBox.Refresh()
+		a.availableBox.Objects = nil
+		a.availableBox.Refresh()
+		a.connectedBox.Objects = nil
+		a.connectedBox.Refresh()
 	})
 
 	a.recording = false

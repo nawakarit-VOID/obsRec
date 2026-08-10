@@ -137,7 +137,7 @@ func moveSinkInput(id int, sink string) error {
 // sinkName โดยอัตโนมัติ เพื่อแทนที่ขั้นตอนลากสายเสียงมือใน qpwgraph
 type AudioRouter struct {
 	mu     sync.Mutex
-	routed map[int]bool // sink-input id ที่ถูกย้ายไปแล้ว กันย้ำซ้ำ
+	routed map[int]string // sink-input id -> label ที่ถูกย้ายไปแล้ว
 	cancel context.CancelFunc
 	logf   func(format string, args ...interface{})
 }
@@ -157,7 +157,7 @@ func (r *AudioRouter) Start() error {
 	r.logf("สร้าง/ยืนยัน sink %s เรียบร้อย", sinkName)
 
 	r.mu.Lock()
-	r.routed = make(map[int]bool)
+	r.routed = make(map[int]string)
 	r.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,7 +180,7 @@ func (r *AudioRouter) Stop() {
 			r.logf("ย้าย stream #%d กลับ default sink แล้ว", id)
 		}
 	}
-	r.routed = make(map[int]bool)
+	r.routed = make(map[int]string)
 	r.mu.Unlock()
 }
 
@@ -211,7 +211,19 @@ func (r *AudioRouter) ListPlayingFirefoxStreams() ([]SinkInput, error) {
 func (r *AudioRouter) IsRouted(id int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.routed[id]
+	_, ok := r.routed[id]
+	return ok
+}
+
+// ListRouted คืนรายการ (id, label) ของ stream ที่กำลังเชื่อมกับ OBS อยู่ตอนนี้
+func (r *AudioRouter) ListRouted() []SinkInput {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]SinkInput, 0, len(r.routed))
+	for id, label := range r.routed {
+		result = append(result, SinkInput{ID: id, MediaName: label})
+	}
+	return result
 }
 
 // RouteManually ย้าย sink-input ที่ระบุเข้า OBS sink ตามที่คนเลือกเองจาก UI
@@ -221,11 +233,24 @@ func (r *AudioRouter) RouteManually(id int, label string) error {
 	}
 	r.mu.Lock()
 	if r.routed == nil {
-		r.routed = make(map[int]bool)
+		r.routed = make(map[int]string)
 	}
-	r.routed[id] = true
+	r.routed[id] = label
 	r.mu.Unlock()
-	r.logf("เลือกเองจากรายการ: ย้าย stream #%d (%s) เข้า %s แล้ว", id, label, sinkName)
+	r.logf("เชื่อมเอง: ย้าย stream #%d (%s) เข้า %s แล้ว", id, label, sinkName)
+	return nil
+}
+
+// DisconnectOne ยกเลิกการเชื่อม stream เดียว ย้ายกลับ default sink
+func (r *AudioRouter) DisconnectOne(id int) error {
+	if err := moveSinkInput(id, "@DEFAULT_SINK@"); err != nil {
+		return fmt.Errorf("ย้าย stream กลับไม่สำเร็จ: %w", err)
+	}
+	r.mu.Lock()
+	label := r.routed[id]
+	delete(r.routed, id)
+	r.mu.Unlock()
+	r.logf("ยกเลิกเอง: ย้าย stream #%d (%s) กลับ default sink แล้ว", id, label)
 	return nil
 }
 
@@ -265,7 +290,7 @@ func (r *AudioRouter) tick() {
 		}
 		matched = true
 		r.mu.Lock()
-		already := r.routed[si.ID]
+		_, already := r.routed[si.ID]
 		r.mu.Unlock()
 		if already {
 			continue
@@ -274,8 +299,12 @@ func (r *AudioRouter) tick() {
 			r.logf("ย้าย stream #%d ไม่สำเร็จ: %v", si.ID, err)
 			continue
 		}
+		label := si.MediaName
+		if label == "" {
+			label = si.AppName
+		}
 		r.mu.Lock()
-		r.routed[si.ID] = true
+		r.routed[si.ID] = label
 		r.mu.Unlock()
 		r.logf("เจอ PiP (PID %d) -> ย้าย stream #%d (%s) เข้า %s แล้ว", pid, si.ID, si.AppName, sinkName)
 	}
