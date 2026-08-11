@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -44,8 +45,9 @@ type App struct {
 	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
 	sourcesBox  *fyne.Container // รายการ audio stream ทั้งหมด แบบ toggle ✅/⬜
 
-	stopRequested chan struct{}
-	recording     bool
+	stopRequested  chan struct{}
+	recording      bool
+	pipWatchCancel context.CancelFunc
 }
 
 func main() {
@@ -418,6 +420,94 @@ func (a *App) disconnectAllFromOBS() {
 	}
 }
 
+// startPiPAutoWatch จด baseline ของ stream ที่มีอยู่ตอนนี้ (ก่อนกดเล่นวิดีโอ) แล้วเริ่ม
+// poll หา stream ใหม่ที่โผล่ขึ้นมาทีหลัง เพื่อจับให้ได้ว่าอันไหนคือ PiP ที่เพิ่งเล่น
+// โดยไม่ไปยุ่งกับ stream อื่นที่เล่นอยู่ก่อนแล้ว (กันดึงเสียงจาก Firefox หน้าต่างอื่นผิดตัว)
+func (a *App) startPiPAutoWatch() {
+	_, inputs, err := a.loadAudioState()
+	if err != nil {
+		a.appendLog("เริ่ม auto-watch ไม่สำเร็จ: %v", err)
+		return
+	}
+	baseline := make(map[int]bool, len(inputs))
+	for _, si := range inputs {
+		baseline[si.ID] = true
+	}
+	a.appendLog("เริ่มเฝ้าหา PiP อัตโนมัติ (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.pipWatchCancel = cancel
+	go a.pipWatchLoop(ctx, baseline)
+}
+
+func (a *App) stopPiPAutoWatch() {
+	if a.pipWatchCancel != nil {
+		a.pipWatchCancel()
+		a.pipWatchCancel = nil
+	}
+}
+
+func (a *App) pipWatchLoop(ctx context.Context, baseline map[int]bool) {
+	ticker := time.NewTicker(1500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if a.pipWatchTick(baseline) {
+				return // เจอแล้ว เชื่อมสำเร็จ ไม่ต้องเฝ้าต่อ
+			}
+		}
+	}
+}
+
+// pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
+func (a *App) pipWatchTick(baseline map[int]bool) bool {
+	obsIndex, inputs, err := a.loadAudioState()
+	if err != nil {
+		a.appendLog("auto-watch อ่านสถานะไม่สำเร็จ: %v", err)
+		return false
+	}
+
+	var candidates []SinkInput
+	for _, si := range inputs {
+		if baseline[si.ID] {
+			continue // มีอยู่ก่อนกด Record แล้ว ไม่ใช่ตัวใหม่ที่ต้องการ
+		}
+		if si.SinkIndex == obsIndex {
+			continue // เชื่อมอยู่แล้ว
+		}
+		if si.Corked {
+			continue // ยังไม่มีเสียงออกจริงตอนนี้
+		}
+		if !strings.Contains(strings.ToLower(si.Props["application.name"]), "firefox") {
+			continue
+		}
+		candidates = append(candidates, si)
+	}
+
+	switch len(candidates) {
+	case 0:
+		return false
+	case 1:
+		target := candidates[0]
+		if err := moveSinkInput(target.ID, sinkName); err != nil {
+			a.appendLog("เชื่อม stream #%d ไม่สำเร็จ: %v", target.ID, err)
+			return false
+		}
+		a.appendLog("✅ ออโต้จับ PiP สำเร็จ: stream ใหม่ #%d (%s) เชื่อมกับ OBS แล้ว", target.ID, target.DisplayLabel())
+		obsIndex2, inputs2, err := a.loadAudioState()
+		if err == nil {
+			a.renderSources(obsIndex2, inputs2)
+		}
+		return true
+	default:
+		a.appendLog("เจอ stream ใหม่มากกว่า 1 ตัวพร้อมกัน (%d ตัว) ไม่แน่ใจว่าตัวไหนคือ PiP รอดูรอบถัดไปหรือเลือกเองด้านล่าง", len(candidates))
+		return false
+	}
+}
+
 // ==== Recording flow ====
 
 func (a *App) setStatus(s string) {
@@ -450,6 +540,8 @@ func (a *App) onRecordPressed() {
 	a.recordBtn.Disable()
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
+
+	a.startPiPAutoWatch()
 
 	go a.runRecordingFlow(dur)
 }
@@ -492,6 +584,7 @@ func (a *App) finishRecording(reason string) {
 		}
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
+	a.stopPiPAutoWatch()
 	a.disconnectAllFromOBS()
 
 	a.recording = false

@@ -18,6 +18,7 @@ const sinkName = "OBS_Record"
 type SinkInput struct {
 	ID        int
 	SinkIndex int               // index ของ sink ปลายทางที่ stream นี้กำลังต่ออยู่ตอนนี้
+	Corked    bool              // true = หยุดเล่นชั่วคราว (paused/ไม่มีเสียงออกตอนนี้)
 	Props     map[string]string // property ทั้งหมด เช่น application.name, media.title, application.process.id
 }
 
@@ -92,6 +93,7 @@ var sinkInputHeaderRe = regexp.MustCompile(`(?m)^Sink Input #(\d+)`)
 var sinkIndexRe = regexp.MustCompile(`(?m)^\s*Sink:\s*(\d+)`)
 var mediaNameLineRe = regexp.MustCompile(`(?m)^\s*Media Name:\s*"([^"]*)"`)
 var propLineRe = regexp.MustCompile(`(?m)^\s*([\w.]+)\s*=\s*"([^"]*)"`)
+var corkedRe = regexp.MustCompile(`(?m)^\s*Corked:\s*(yes|no)`)
 
 // listSinkInputs อ่าน audio stream ทั้งหมดที่กำลังเล่นอยู่ตอนนี้
 func listSinkInputs() ([]SinkInput, error) {
@@ -121,6 +123,9 @@ func listSinkInputs() ([]SinkInput, error) {
 			if _, ok := si.Props["media.name"]; !ok {
 				si.Props["media.name"] = mm[1]
 			}
+		}
+		if cm := corkedRe.FindStringSubmatch(block); cm != nil {
+			si.Corked = cm[1] == "yes"
 		}
 		result = append(result, si)
 	}
