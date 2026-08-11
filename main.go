@@ -486,6 +486,17 @@ func (a *App) pipWatchLoop(ctx context.Context, baseline map[int]bool) {
 
 // pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
 func (a *App) pipWatchTick(baseline map[int]bool) bool {
+	// เช็คก่อนว่ามีหน้าต่าง PiP เปิดอยู่จริงตอนนี้มั้ย ถ้าไม่มี ไม่ต้องพิจารณาอะไรเลย
+	// (กันเผลอเปิดวิดีโออื่นที่ไม่ใช่ PiP แล้วโดนดึงเข้ามาผิดตัว)
+	_, pipOpen, err := findPiPWindowPID()
+	if err != nil {
+		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
+		return false
+	}
+	if !pipOpen {
+		return false
+	}
+
 	obsIndex, inputs, err := a.loadAudioState()
 	if err != nil {
 		a.appendLog("auto-watch อ่านสถานะไม่สำเร็จ: %v", err)
