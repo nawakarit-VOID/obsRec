@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -48,6 +49,10 @@ type App struct {
 	stopRequested  chan struct{}
 	recording      bool
 	pipWatchCancel context.CancelFunc
+
+	lockedMu   sync.Mutex
+	lockedIDs  map[int]bool
+	lockCancel context.CancelFunc
 }
 
 func main() {
@@ -60,6 +65,7 @@ func main() {
 	}
 	myApp.buildUI()
 	myApp.tryAutoConnect()
+	myApp.startLockEnforcer()
 
 	w.Resize(fyne.NewSize(420, 620))
 	w.ShowAndRun()
@@ -271,7 +277,7 @@ func (a *App) loadAudioState() (int, []SinkInput, error) {
 	return obsIndex, inputs, nil
 }
 
-// renderSources สร้างปุ่ม toggle ให้แต่ละ stream ตามข้อมูลที่มี
+// renderSources สร้างปุ่ม toggle + ปุ่มล็อก ให้แต่ละ stream ตามข้อมูลที่มี
 func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 	fyne.Do(func() {
 		a.sourcesBox.Objects = nil
@@ -281,6 +287,8 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 		for _, si := range inputs {
 			si := si // capture ตัวแปรสำหรับ closure
 			connected := si.SinkIndex == obsIndex
+			locked := a.isLocked(si.ID)
+
 			prefix := "⬜ "
 			importance := widget.MediumImportance
 			if connected {
@@ -289,9 +297,13 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 			}
 			btnLabel := fmt.Sprintf("%s%s (#%d)", prefix, si.DisplayLabel(), si.ID)
 
-			btn := widget.NewButton(btnLabel, nil)
-			btn.Importance = importance
-			btn.OnTapped = func() {
+			toggleBtn := widget.NewButton(btnLabel, nil)
+			toggleBtn.Importance = importance
+			toggleBtn.OnTapped = func() {
+				if a.isLocked(si.ID) {
+					a.appendLog("stream #%d ถูกล็อกอยู่ ปลดล็อกก่อนถึงจะย้ายได้", si.ID)
+					return
+				}
 				target := sinkName
 				if connected {
 					target = "@DEFAULT_SINK@"
@@ -302,7 +314,17 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 				}
 				a.scan()
 			}
-			a.sourcesBox.Add(btn)
+
+			lockLabel := "🔓"
+			if locked {
+				lockLabel = "🔒"
+			}
+			lockBtn := widget.NewButton(lockLabel, func() {
+				a.toggleLock(si.ID)
+			})
+
+			row := container.NewHBox(toggleBtn, lockBtn)
+			a.sourcesBox.Add(row)
 		}
 		a.sourcesBox.Refresh()
 	})
@@ -508,6 +530,115 @@ func (a *App) pipWatchTick(baseline map[int]bool) bool {
 	}
 }
 
+// ==== Lock (กันไม่ให้ stream ที่เชื่อมกับ OBS ถูกย้ายออกไปเฉยๆ) ====
+
+func (a *App) isLocked(id int) bool {
+	a.lockedMu.Lock()
+	defer a.lockedMu.Unlock()
+	return a.lockedIDs[id]
+}
+
+// toggleLock สลับสถานะล็อกของ stream นี้ ถ้าล็อกใหม่จะเชื่อมเข้า OBS ให้ทันทีด้วย
+func (a *App) toggleLock(id int) {
+	a.lockedMu.Lock()
+	if a.lockedIDs == nil {
+		a.lockedIDs = map[int]bool{}
+	}
+	wasLocked := a.lockedIDs[id]
+	if wasLocked {
+		delete(a.lockedIDs, id)
+	} else {
+		a.lockedIDs[id] = true
+	}
+	a.lockedMu.Unlock()
+
+	if !wasLocked {
+		if err := moveSinkInput(id, sinkName); err != nil {
+			a.appendLog("ล็อก stream #%d ไม่สำเร็จ: %v", id, err)
+		} else {
+			a.appendLog("🔒 ล็อก stream #%d ไว้กับ OBS แล้ว (ถ้าถูกย้ายออกจะดึงกลับให้เอง)", id)
+		}
+	} else {
+		a.appendLog("🔓 ปลดล็อก stream #%d แล้ว", id)
+	}
+	a.scan()
+}
+
+// clearAllLocks ล้างสถานะล็อกทั้งหมด ใช้ตอนจบ session การอัด
+func (a *App) clearAllLocks() {
+	a.lockedMu.Lock()
+	a.lockedIDs = map[int]bool{}
+	a.lockedMu.Unlock()
+}
+
+// startLockEnforcer เริ่ม loop เฝ้าคอยดึง stream ที่ล็อกไว้กลับเข้า OBS
+// ตลอดอายุของแอพ (ไม่ขึ้นกับว่ากำลังอัดอยู่หรือไม่)
+func (a *App) startLockEnforcer() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.lockCancel = cancel
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.enforceLocks()
+			}
+		}
+	}()
+}
+
+func (a *App) enforceLocks() {
+	a.lockedMu.Lock()
+	ids := make([]int, 0, len(a.lockedIDs))
+	for id := range a.lockedIDs {
+		ids = append(ids, id)
+	}
+	a.lockedMu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+
+	obsIndex, inputs, err := a.loadAudioState()
+	if err != nil {
+		return
+	}
+	existing := make(map[int]SinkInput, len(inputs))
+	for _, si := range inputs {
+		existing[si.ID] = si
+	}
+
+	changed := false
+	for _, id := range ids {
+		si, ok := existing[id]
+		if !ok {
+			// stream หายไปแล้ว (ปิดแท็บ/จบวิดีโอ) เลิกล็อกไปเลย ไม่งั้นจะเฝ้าของที่ไม่มีอยู่จริงตลอด
+			a.lockedMu.Lock()
+			delete(a.lockedIDs, id)
+			a.lockedMu.Unlock()
+			a.appendLog("stream #%d ที่ล็อกไว้หายไปแล้ว เลิกล็อกอัตโนมัติ", id)
+			changed = true
+			continue
+		}
+		if si.SinkIndex != obsIndex {
+			if err := moveSinkInput(id, sinkName); err != nil {
+				a.appendLog("ล็อก: ดึง stream #%d กลับ OBS ไม่สำเร็จ: %v", id, err)
+				continue
+			}
+			a.appendLog("🔒 stream #%d ถูกย้ายออกไป ดึงกลับเข้า OBS ตามล็อกแล้ว", id)
+			changed = true
+		}
+	}
+	if changed {
+		obsIndex2, inputs2, err := a.loadAudioState()
+		if err == nil {
+			a.renderSources(obsIndex2, inputs2)
+		}
+	}
+}
+
 // ==== Recording flow ====
 
 func (a *App) setStatus(s string) {
@@ -585,6 +716,7 @@ func (a *App) finishRecording(reason string) {
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
 	a.stopPiPAutoWatch()
+	a.clearAllLocks()
 	a.disconnectAllFromOBS()
 
 	a.recording = false
