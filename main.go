@@ -116,8 +116,6 @@ func (a *App) buildUI() {
 	// ==== ส่วน audio routing ====
 	a.sourcesBox = container.NewVBox()
 	scanBtn := widget.NewButton("สแกนแหล่งเสียง", a.scan)
-	autoBtn := widget.NewButton("เชื่อมอัตโนมัติจาก PiP", a.autoConnectFromPiP)
-	autoBtn.Importance = widget.HighImportance
 
 	content := container.NewVBox(
 		connBox,
@@ -132,7 +130,7 @@ func (a *App) buildUI() {
 		a.statusLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("Audio routing (คลิกที่ชิปเพื่อเชื่อม/ยกเลิก):"),
-		container.NewHBox(scanBtn, autoBtn),
+		scanBtn,
 		a.sourcesBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Log:"),
@@ -327,82 +325,6 @@ func (a *App) scan() {
 	}
 	a.renderSources(obsIndex, inputs)
 	a.appendLog("สแกนแล้ว เจอ %d แหล่งเสียง", len(inputs))
-}
-
-// autoConnectFromPiP เช็คว่ามีหน้าต่าง Picture-in-Picture เปิดอยู่ไหม (กดเองเป็นครั้งๆ ไป)
-// ถ้ามี จะตัดการเชื่อมต่อเดิมทั้งหมด แล้วเชื่อมเฉพาะ stream ของแท็บนั้น
-// (แค่อันเดียว) เข้า OBS_Record ให้อัตโนมัติ
-func (a *App) autoConnectFromPiP() {
-	pid, found, err := findPiPWindowPID()
-	if err != nil {
-		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
-		return
-	}
-	if !found {
-		a.appendLog("ไม่พบหน้าต่าง Picture-in-Picture ที่เปิดอยู่ตอนนี้")
-		return
-	}
-
-	obsIndex, inputs, err := a.loadAudioState()
-	if err != nil {
-		a.appendLog("%v", err)
-		return
-	}
-
-	// ตัดการเชื่อมต่อเดิมทั้งหมดก่อน ให้เหลือแค่อันเดียวตามที่ต้องการ
-	for _, si := range inputs {
-		if si.SinkIndex == obsIndex {
-			_ = moveSinkInput(si.ID, "@DEFAULT_SINK@")
-			a.unapprove(si.ID)
-		}
-	}
-
-	// ลอง match ด้วย PID ตรงๆ ก่อน (แม่นสุดถ้าตรง)
-	pidStr := strconv.Itoa(pid)
-	var target *SinkInput
-	for i := range inputs {
-		if inputs[i].Props["application.process.id"] == pidStr {
-			target = &inputs[i]
-			break
-		}
-	}
-
-	usedFallback := false
-	if target == nil {
-		usedFallback = true
-		for i := range inputs {
-			if !strings.Contains(strings.ToLower(inputs[i].Props["application.name"]), "firefox") {
-				continue
-			}
-			if target == nil || inputs[i].ID > target.ID {
-				target = &inputs[i]
-			}
-		}
-	}
-
-	if target == nil {
-		a.appendLog("เจอ PiP (pid=%d) แต่หา audio stream ของ Firefox ไม่เจอเลย", pid)
-		obsIndex2, inputs2, _ := a.loadAudioState()
-		a.renderSources(obsIndex2, inputs2)
-		return
-	}
-
-	if err := moveSinkInput(target.ID, sinkName); err != nil {
-		a.appendLog("เชื่อม stream #%d ไม่สำเร็จ: %v", target.ID, err)
-		return
-	}
-	a.approve(target.ID)
-
-	obsIndex2, inputs2, err := a.loadAudioState()
-	if err == nil {
-		a.renderSources(obsIndex2, inputs2)
-	}
-
-	if usedFallback {
-		a.appendLog("⚠️ PID ไม่ตรงกัน (PiP pid=%d) ใช้ fallback เชื่อม stream ล่าสุดแทน: #%d — เช็คด้วยรายการด้านล่างว่าใช่ตัวที่ต้องการไหม", pid, target.ID)
-	} else {
-		a.appendLog("✅ เจอ PiP (pid=%d) ตรงกับ stream #%d เชื่อมเรียบร้อยแล้ว", pid, target.ID)
-	}
 }
 
 // disconnectAllFromOBS ย้าย stream ที่เชื่อมกับ OBS อยู่ตอนนี้ทั้งหมดกลับ default sink
