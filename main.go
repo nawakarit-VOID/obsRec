@@ -55,6 +55,10 @@ type App struct {
 	lockCancel context.CancelFunc
 
 	pipMatched bool // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
+
+	approvedMu  sync.Mutex
+	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (จาก auto-match ตัวแรก หรือคนกดเอง)
+	guardCancel context.CancelFunc
 }
 
 func main() {
@@ -314,6 +318,11 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 					a.appendLog("ย้าย stream #%d ไม่สำเร็จ: %v", si.ID, err)
 					return
 				}
+				if connected {
+					a.unapprove(si.ID)
+				} else {
+					a.approve(si.ID)
+				}
 				a.scan()
 			}
 
@@ -404,6 +413,7 @@ func (a *App) autoConnectFromPiP() {
 		a.appendLog("เชื่อม stream #%d ไม่สำเร็จ: %v", target.ID, err)
 		return
 	}
+	a.approve(target.ID)
 
 	obsIndex2, inputs2, err := a.loadAudioState()
 	if err == nil {
@@ -538,6 +548,7 @@ func (a *App) pipWatchTick(baseline map[int]bool) bool {
 			return false
 		}
 		a.appendLog("✅ ออโต้จับ PiP สำเร็จ: stream ใหม่ #%d (%s) เชื่อมกับ OBS แล้ว", target.ID, target.DisplayLabel())
+		a.approve(target.ID)
 		a.pipMatched = true
 		a.appendLog("🔒 หยุดเฝ้าดูอัตโนมัติแล้ว หลังจากนี้จนกว่าจะกด Record รอบใหม่ จะไม่เชื่อมอะไรเพิ่มเองอีกเด็ดขาด (เชื่อมเองได้ผ่านรายการด้านล่างเท่านั้น)")
 		obsIndex2, inputs2, err := a.loadAudioState()
@@ -577,9 +588,11 @@ func (a *App) toggleLock(id int) {
 		if err := moveSinkInput(id, sinkName); err != nil {
 			a.appendLog("ล็อก stream #%d ไม่สำเร็จ: %v", id, err)
 		} else {
+			a.approve(id)
 			a.appendLog("🔒 ล็อก stream #%d ไว้กับ OBS แล้ว (ถ้าถูกย้ายออกจะดึงกลับให้เอง)", id)
 		}
 	} else {
+		a.unapprove(id)
 		a.appendLog("🔓 ปลดล็อก stream #%d แล้ว", id)
 	}
 	a.scan()
@@ -660,6 +673,91 @@ func (a *App) enforceLocks() {
 	}
 }
 
+// ==== Guard: ดีด stream ที่ไม่ได้รับอนุญาตออกจาก OBS_Record ====
+// ป้องกันกรณีระบบเสียง (PipeWire stream-restore) auto-route stream ใหม่ของ Firefox
+// เข้า OBS_Record เองโดยที่เราไม่ได้สั่ง
+
+func (a *App) approve(id int) {
+	a.approvedMu.Lock()
+	if a.approvedIDs == nil {
+		a.approvedIDs = map[int]bool{}
+	}
+	a.approvedIDs[id] = true
+	a.approvedMu.Unlock()
+}
+
+func (a *App) unapprove(id int) {
+	a.approvedMu.Lock()
+	delete(a.approvedIDs, id)
+	a.approvedMu.Unlock()
+}
+
+func (a *App) isApproved(id int) bool {
+	a.approvedMu.Lock()
+	defer a.approvedMu.Unlock()
+	return a.approvedIDs[id]
+}
+
+func (a *App) clearApproved() {
+	a.approvedMu.Lock()
+	a.approvedIDs = map[int]bool{}
+	a.approvedMu.Unlock()
+}
+
+// startOBSGuard เริ่ม loop เฝ้าตลอดช่วงอัด คอยเช็คว่ามี stream แปลกปลอมที่ไม่ได้รับ
+// อนุญาตหลุดเข้า OBS_Record มาเองมั้ย (เช่นจาก PipeWire auto-restore) ถ้าเจอจะดีดออกทันที
+func (a *App) startOBSGuard() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.guardCancel = cancel
+	go func() {
+		ticker := time.NewTicker(1200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.guardTick()
+			}
+		}
+	}()
+}
+
+func (a *App) stopOBSGuard() {
+	if a.guardCancel != nil {
+		a.guardCancel()
+		a.guardCancel = nil
+	}
+}
+
+func (a *App) guardTick() {
+	obsIndex, inputs, err := a.loadAudioState()
+	if err != nil {
+		return
+	}
+	changed := false
+	for _, si := range inputs {
+		if si.SinkIndex != obsIndex {
+			continue
+		}
+		if a.isApproved(si.ID) {
+			continue
+		}
+		if err := moveSinkInput(si.ID, "@DEFAULT_SINK@"); err != nil {
+			a.appendLog("ดีด stream #%d ที่ไม่ได้รับอนุญาตออกไม่สำเร็จ: %v", si.ID, err)
+			continue
+		}
+		a.appendLog("🚫 มีเสียงที่ไม่ได้รับอนุญาต (#%d %s) หลุดเข้า OBS มาเอง ดีดออกกลับ default sink แล้ว", si.ID, si.DisplayLabel())
+		changed = true
+	}
+	if changed {
+		obsIndex2, inputs2, err := a.loadAudioState()
+		if err == nil {
+			a.renderSources(obsIndex2, inputs2)
+		}
+	}
+}
+
 // ==== Recording flow ====
 
 func (a *App) setStatus(s string) {
@@ -694,6 +792,7 @@ func (a *App) onRecordPressed() {
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
 
 	a.startPiPAutoWatch()
+	a.startOBSGuard()
 
 	go a.runRecordingFlow(dur)
 }
@@ -737,8 +836,10 @@ func (a *App) finishRecording(reason string) {
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
 	a.stopPiPAutoWatch()
+	a.stopOBSGuard()
 	a.pipMatched = false
 	a.clearAllLocks()
+	a.clearApproved()
 	a.disconnectAllFromOBS()
 
 	a.recording = false
