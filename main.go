@@ -46,18 +46,11 @@ type App struct {
 	presetsBox  *fyne.Container // ที่เก็บปุ่ม preset ทั้งหมด ไว้ rebuild ใหม่ทุกครั้งที่แก้ list
 	sourcesBox  *fyne.Container // รายการ audio stream ทั้งหมด แบบ toggle ✅/⬜
 
-	stopRequested  chan struct{}
-	recording      bool
-	pipWatchCancel context.CancelFunc
-
-	lockedMu   sync.Mutex
-	lockedIDs  map[int]bool
-	lockCancel context.CancelFunc
-
-	pipMatched bool // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
+	stopRequested chan struct{}
+	recording     bool
 
 	approvedMu  sync.Mutex
-	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (จาก auto-match ตัวแรก หรือคนกดเอง)
+	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
 	guardCancel context.CancelFunc
 }
 
@@ -71,9 +64,8 @@ func main() {
 	}
 	myApp.buildUI()
 	myApp.tryAutoConnect()
-	myApp.startLockEnforcer()
 
-	w.Resize(fyne.NewSize(420, 620))
+	w.Resize(fyne.NewSize(420, 600))
 	w.ShowAndRun()
 }
 
@@ -283,7 +275,7 @@ func (a *App) loadAudioState() (int, []SinkInput, error) {
 	return obsIndex, inputs, nil
 }
 
-// renderSources สร้างปุ่ม toggle + ปุ่มล็อก ให้แต่ละ stream ตามข้อมูลที่มี
+// renderSources สร้างปุ่ม toggle ให้แต่ละ stream ตามข้อมูลที่มี
 func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 	fyne.Do(func() {
 		a.sourcesBox.Objects = nil
@@ -293,7 +285,6 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 		for _, si := range inputs {
 			si := si // capture ตัวแปรสำหรับ closure
 			connected := si.SinkIndex == obsIndex
-			locked := a.isLocked(si.ID)
 
 			prefix := "⬜ "
 			importance := widget.MediumImportance
@@ -306,10 +297,6 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 			toggleBtn := widget.NewButton(btnLabel, nil)
 			toggleBtn.Importance = importance
 			toggleBtn.OnTapped = func() {
-				if a.isLocked(si.ID) {
-					a.appendLog("stream #%d ถูกล็อกอยู่ ปลดล็อกก่อนถึงจะย้ายได้", si.ID)
-					return
-				}
 				target := sinkName
 				if connected {
 					target = "@DEFAULT_SINK@"
@@ -325,17 +312,7 @@ func (a *App) renderSources(obsIndex int, inputs []SinkInput) {
 				}
 				a.scan()
 			}
-
-			lockLabel := "🔓"
-			if locked {
-				lockLabel = "🔒"
-			}
-			lockBtn := widget.NewButton(lockLabel, func() {
-				a.toggleLock(si.ID)
-			})
-
-			row := container.NewHBox(toggleBtn, lockBtn)
-			a.sourcesBox.Add(row)
+			a.sourcesBox.Add(toggleBtn)
 		}
 		a.sourcesBox.Refresh()
 	})
@@ -352,7 +329,7 @@ func (a *App) scan() {
 	a.appendLog("สแกนแล้ว เจอ %d แหล่งเสียง", len(inputs))
 }
 
-// autoConnectFromPiP เช็คว่ามีหน้าต่าง Picture-in-Picture เปิดอยู่ไหม
+// autoConnectFromPiP เช็คว่ามีหน้าต่าง Picture-in-Picture เปิดอยู่ไหม (กดเองเป็นครั้งๆ ไป)
 // ถ้ามี จะตัดการเชื่อมต่อเดิมทั้งหมด แล้วเชื่อมเฉพาะ stream ของแท็บนั้น
 // (แค่อันเดียว) เข้า OBS_Record ให้อัตโนมัติ
 func (a *App) autoConnectFromPiP() {
@@ -376,6 +353,7 @@ func (a *App) autoConnectFromPiP() {
 	for _, si := range inputs {
 		if si.SinkIndex == obsIndex {
 			_ = moveSinkInput(si.ID, "@DEFAULT_SINK@")
+			a.unapprove(si.ID)
 		}
 	}
 
@@ -451,225 +429,6 @@ func (a *App) disconnectAllFromOBS() {
 	obsIndex2, inputs2, err := a.loadAudioState()
 	if err == nil {
 		a.renderSources(obsIndex2, inputs2)
-	}
-}
-
-// startPiPAutoWatch จด baseline ของ stream ที่มีอยู่ตอนนี้ (ก่อนกดเล่นวิดีโอ) แล้วเริ่ม
-// poll หา stream ใหม่ที่โผล่ขึ้นมาทีหลัง เพื่อจับให้ได้ว่าอันไหนคือ PiP ที่เพิ่งเล่น
-// โดยไม่ไปยุ่งกับ stream อื่นที่เล่นอยู่ก่อนแล้ว (กันดึงเสียงจาก Firefox หน้าต่างอื่นผิดตัว)
-func (a *App) startPiPAutoWatch() {
-	_, inputs, err := a.loadAudioState()
-	if err != nil {
-		a.appendLog("เริ่ม auto-watch ไม่สำเร็จ: %v", err)
-		return
-	}
-	baseline := make(map[int]bool, len(inputs))
-	for _, si := range inputs {
-		baseline[si.ID] = true
-	}
-	a.pipMatched = false
-	a.appendLog("เริ่มเฝ้าหา PiP อัตโนมัติ (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.pipWatchCancel = cancel
-	go a.pipWatchLoop(ctx, baseline)
-}
-
-func (a *App) stopPiPAutoWatch() {
-	if a.pipWatchCancel != nil {
-		a.pipWatchCancel()
-		a.pipWatchCancel = nil
-	}
-}
-
-func (a *App) pipWatchLoop(ctx context.Context, baseline map[int]bool) {
-	ticker := time.NewTicker(1500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if a.pipWatchTick(baseline) {
-				return // เจอแล้ว เชื่อมสำเร็จ ไม่ต้องเฝ้าต่อ
-			}
-		}
-	}
-}
-
-// pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
-func (a *App) pipWatchTick(baseline map[int]bool) bool {
-	// เจอและเชื่อมไปแล้วในรอบนี้ ห้ามเชื่อมอะไรเพิ่มอีกเด็ดขาด (เว้นแต่คนกดเอง)
-	if a.pipMatched {
-		return true
-	}
-
-	// เช็คก่อนว่ามีหน้าต่าง PiP เปิดอยู่จริงตอนนี้มั้ย ถ้าไม่มี ไม่ต้องพิจารณาอะไรเลย
-	// (กันเผลอเปิดวิดีโออื่นที่ไม่ใช่ PiP แล้วโดนดึงเข้ามาผิดตัว)
-	_, pipOpen, err := findPiPWindowPID()
-	if err != nil {
-		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
-		return false
-	}
-	if !pipOpen {
-		return false
-	}
-
-	obsIndex, inputs, err := a.loadAudioState()
-	if err != nil {
-		a.appendLog("auto-watch อ่านสถานะไม่สำเร็จ: %v", err)
-		return false
-	}
-
-	var candidates []SinkInput
-	for _, si := range inputs {
-		if baseline[si.ID] {
-			continue // มีอยู่ก่อนกด Record แล้ว ไม่ใช่ตัวใหม่ที่ต้องการ
-		}
-		if si.SinkIndex == obsIndex {
-			continue // เชื่อมอยู่แล้ว
-		}
-		if si.Corked {
-			continue // ยังไม่มีเสียงออกจริงตอนนี้
-		}
-		if !strings.Contains(strings.ToLower(si.Props["application.name"]), "firefox") {
-			continue
-		}
-		candidates = append(candidates, si)
-	}
-
-	switch len(candidates) {
-	case 0:
-		return false
-	case 1:
-		target := candidates[0]
-		if err := moveSinkInput(target.ID, sinkName); err != nil {
-			a.appendLog("เชื่อม stream #%d ไม่สำเร็จ: %v", target.ID, err)
-			return false
-		}
-		a.appendLog("✅ ออโต้จับ PiP สำเร็จ: stream ใหม่ #%d (%s) เชื่อมกับ OBS แล้ว", target.ID, target.DisplayLabel())
-		a.approve(target.ID)
-		a.pipMatched = true
-		a.appendLog("🔒 หยุดเฝ้าดูอัตโนมัติแล้ว หลังจากนี้จนกว่าจะกด Record รอบใหม่ จะไม่เชื่อมอะไรเพิ่มเองอีกเด็ดขาด (เชื่อมเองได้ผ่านรายการด้านล่างเท่านั้น)")
-		obsIndex2, inputs2, err := a.loadAudioState()
-		if err == nil {
-			a.renderSources(obsIndex2, inputs2)
-		}
-		return true
-	default:
-		a.appendLog("เจอ stream ใหม่มากกว่า 1 ตัวพร้อมกัน (%d ตัว) ไม่แน่ใจว่าตัวไหนคือ PiP รอดูรอบถัดไปหรือเลือกเองด้านล่าง", len(candidates))
-		return false
-	}
-}
-
-// ==== Lock (กันไม่ให้ stream ที่เชื่อมกับ OBS ถูกย้ายออกไปเฉยๆ) ====
-
-func (a *App) isLocked(id int) bool {
-	a.lockedMu.Lock()
-	defer a.lockedMu.Unlock()
-	return a.lockedIDs[id]
-}
-
-// toggleLock สลับสถานะล็อกของ stream นี้ ถ้าล็อกใหม่จะเชื่อมเข้า OBS ให้ทันทีด้วย
-func (a *App) toggleLock(id int) {
-	a.lockedMu.Lock()
-	if a.lockedIDs == nil {
-		a.lockedIDs = map[int]bool{}
-	}
-	wasLocked := a.lockedIDs[id]
-	if wasLocked {
-		delete(a.lockedIDs, id)
-	} else {
-		a.lockedIDs[id] = true
-	}
-	a.lockedMu.Unlock()
-
-	if !wasLocked {
-		if err := moveSinkInput(id, sinkName); err != nil {
-			a.appendLog("ล็อก stream #%d ไม่สำเร็จ: %v", id, err)
-		} else {
-			a.approve(id)
-			a.appendLog("🔒 ล็อก stream #%d ไว้กับ OBS แล้ว (ถ้าถูกย้ายออกจะดึงกลับให้เอง)", id)
-		}
-	} else {
-		a.unapprove(id)
-		a.appendLog("🔓 ปลดล็อก stream #%d แล้ว", id)
-	}
-	a.scan()
-}
-
-// clearAllLocks ล้างสถานะล็อกทั้งหมด ใช้ตอนจบ session การอัด
-func (a *App) clearAllLocks() {
-	a.lockedMu.Lock()
-	a.lockedIDs = map[int]bool{}
-	a.lockedMu.Unlock()
-}
-
-// startLockEnforcer เริ่ม loop เฝ้าคอยดึง stream ที่ล็อกไว้กลับเข้า OBS
-// ตลอดอายุของแอพ (ไม่ขึ้นกับว่ากำลังอัดอยู่หรือไม่)
-func (a *App) startLockEnforcer() {
-	ctx, cancel := context.WithCancel(context.Background())
-	a.lockCancel = cancel
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.enforceLocks()
-			}
-		}
-	}()
-}
-
-func (a *App) enforceLocks() {
-	a.lockedMu.Lock()
-	ids := make([]int, 0, len(a.lockedIDs))
-	for id := range a.lockedIDs {
-		ids = append(ids, id)
-	}
-	a.lockedMu.Unlock()
-	if len(ids) == 0 {
-		return
-	}
-
-	obsIndex, inputs, err := a.loadAudioState()
-	if err != nil {
-		return
-	}
-	existing := make(map[int]SinkInput, len(inputs))
-	for _, si := range inputs {
-		existing[si.ID] = si
-	}
-
-	changed := false
-	for _, id := range ids {
-		si, ok := existing[id]
-		if !ok {
-			// stream หายไปแล้ว (ปิดแท็บ/จบวิดีโอ) เลิกล็อกไปเลย ไม่งั้นจะเฝ้าของที่ไม่มีอยู่จริงตลอด
-			a.lockedMu.Lock()
-			delete(a.lockedIDs, id)
-			a.lockedMu.Unlock()
-			a.appendLog("stream #%d ที่ล็อกไว้หายไปแล้ว เลิกล็อกอัตโนมัติ", id)
-			changed = true
-			continue
-		}
-		if si.SinkIndex != obsIndex {
-			if err := moveSinkInput(id, sinkName); err != nil {
-				a.appendLog("ล็อก: ดึง stream #%d กลับ OBS ไม่สำเร็จ: %v", id, err)
-				continue
-			}
-			a.appendLog("🔒 stream #%d ถูกย้ายออกไป ดึงกลับเข้า OBS ตามล็อกแล้ว", id)
-			changed = true
-		}
-	}
-	if changed {
-		obsIndex2, inputs2, err := a.loadAudioState()
-		if err == nil {
-			a.renderSources(obsIndex2, inputs2)
-		}
 	}
 }
 
@@ -791,7 +550,6 @@ func (a *App) onRecordPressed() {
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
 
-	a.startPiPAutoWatch()
 	a.startOBSGuard()
 
 	go a.runRecordingFlow(dur)
@@ -835,10 +593,7 @@ func (a *App) finishRecording(reason string) {
 		}
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
-	a.stopPiPAutoWatch()
 	a.stopOBSGuard()
-	a.pipMatched = false
-	a.clearAllLocks()
 	a.clearApproved()
 	a.disconnectAllFromOBS()
 
