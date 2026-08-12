@@ -53,6 +53,8 @@ type App struct {
 	lockedMu   sync.Mutex
 	lockedIDs  map[int]bool
 	lockCancel context.CancelFunc
+
+	pipMatched bool // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
 }
 
 func main() {
@@ -455,6 +457,7 @@ func (a *App) startPiPAutoWatch() {
 	for _, si := range inputs {
 		baseline[si.ID] = true
 	}
+	a.pipMatched = false
 	a.appendLog("เริ่มเฝ้าหา PiP อัตโนมัติ (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -486,6 +489,11 @@ func (a *App) pipWatchLoop(ctx context.Context, baseline map[int]bool) {
 
 // pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
 func (a *App) pipWatchTick(baseline map[int]bool) bool {
+	// เจอและเชื่อมไปแล้วในรอบนี้ ห้ามเชื่อมอะไรเพิ่มอีกเด็ดขาด (เว้นแต่คนกดเอง)
+	if a.pipMatched {
+		return true
+	}
+
 	// เช็คก่อนว่ามีหน้าต่าง PiP เปิดอยู่จริงตอนนี้มั้ย ถ้าไม่มี ไม่ต้องพิจารณาอะไรเลย
 	// (กันเผลอเปิดวิดีโออื่นที่ไม่ใช่ PiP แล้วโดนดึงเข้ามาผิดตัว)
 	_, pipOpen, err := findPiPWindowPID()
@@ -530,6 +538,8 @@ func (a *App) pipWatchTick(baseline map[int]bool) bool {
 			return false
 		}
 		a.appendLog("✅ ออโต้จับ PiP สำเร็จ: stream ใหม่ #%d (%s) เชื่อมกับ OBS แล้ว", target.ID, target.DisplayLabel())
+		a.pipMatched = true
+		a.appendLog("🔒 หยุดเฝ้าดูอัตโนมัติแล้ว หลังจากนี้จนกว่าจะกด Record รอบใหม่ จะไม่เชื่อมอะไรเพิ่มเองอีกเด็ดขาด (เชื่อมเองได้ผ่านรายการด้านล่างเท่านั้น)")
 		obsIndex2, inputs2, err := a.loadAudioState()
 		if err == nil {
 			a.renderSources(obsIndex2, inputs2)
@@ -727,6 +737,7 @@ func (a *App) finishRecording(reason string) {
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
 	a.stopPiPAutoWatch()
+	a.pipMatched = false
 	a.clearAllLocks()
 	a.disconnectAllFromOBS()
 
