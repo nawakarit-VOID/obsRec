@@ -79,13 +79,16 @@ func sinkExists() bool {
 }
 
 // ensureSink สร้าง null-sink ถ้ายังไม่มี (idempotent)
+// ใส่ node.autoconnect=false ไว้ด้วย เพื่อบอก WirePlumber ว่าห้ามเลือก sink นี้เป็น
+// เป้าหมายอัตโนมัติเด็ดขาด (ทั้งจาก default policy และ stream-restore memory)
+// ให้ stream ใหม่ไปลงที่ default sink เสมอ จนกว่าโปรแกรมนี้จะสั่งย้ายเอง
 func ensureSink() error {
 	if sinkExists() {
 		return nil
 	}
 	_, err := runCmd("pactl", "load-module", "module-null-sink",
 		fmt.Sprintf("sink_name=%s", sinkName),
-		fmt.Sprintf("sink_properties=device.description=%s", sinkName))
+		fmt.Sprintf("sink_properties=device.description=%s node.autoconnect=false", sinkName))
 	return err
 }
 
