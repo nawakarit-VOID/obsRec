@@ -55,6 +55,8 @@ type App struct {
 	approvedMu  sync.Mutex
 	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
 	guardCancel context.CancelFunc
+
+	testSubCancel context.CancelFunc // ปุ่มทดสอบ Part 1 ชั่วคราว ไว้ลบทิ้งตอน Part 3
 }
 
 func main() {
@@ -119,6 +121,7 @@ func (a *App) buildUI() {
 	// ==== ส่วน audio routing ====
 	a.sourcesBox = container.NewVBox()
 	scanBtn := widget.NewButton("สแกนแหล่งเสียง", a.scan)
+	testSubBtn := widget.NewButton("🧪 ทดสอบฟัง event (Part 1)", a.onTestSubscribeToggled)
 
 	content := container.NewVBox(
 		connBox,
@@ -134,6 +137,7 @@ func (a *App) buildUI() {
 		widget.NewSeparator(),
 		widget.NewLabel("Audio routing (คลิกที่ชิปเพื่อเชื่อม/ยกเลิก):"),
 		scanBtn,
+		testSubBtn,
 		a.sourcesBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Log:"),
@@ -256,6 +260,36 @@ func (a *App) refreshPresets() {
 		a.presetsBox.Add(row)
 	}
 	a.presetsBox.Refresh()
+}
+
+// onTestSubscribeToggled ปุ่มทดสอบชั่วคราวสำหรับ Part 1 — เปิด/ปิดการฟัง event ดิบ
+// จาก pactl subscribe แล้วปริ้นลง log ให้ดูว่าอ่าน event ได้จริงมั้ย ก่อนจะเอาไปต่อกับ
+// guard/pipWatch จริงใน Part 3-4
+func (a *App) onTestSubscribeToggled() {
+	if a.testSubCancel != nil {
+		a.testSubCancel()
+		a.testSubCancel = nil
+		a.appendLog("🧪 หยุดฟัง event ทดสอบแล้ว")
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.testSubCancel = cancel
+
+	events, err := subscribeAudioEvents(ctx)
+	if err != nil {
+		a.appendLog("🧪 เปิดฟัง event ไม่สำเร็จ: %v", err)
+		a.testSubCancel = nil
+		cancel()
+		return
+	}
+	a.appendLog("🧪 เริ่มฟัง event แล้ว (ลองเปิด/ปิดวิดีโอเล่นดูจะเห็น event ขึ้นที่นี่)")
+
+	go func() {
+		for line := range events {
+			a.appendLog("🧪 event: %s", line)
+		}
+	}()
 }
 
 // ==== Audio routing ====

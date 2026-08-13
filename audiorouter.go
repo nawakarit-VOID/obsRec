@@ -4,6 +4,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -49,6 +51,41 @@ func runCmd(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// subscribeAudioEvents เปิด `pactl subscribe` ค้างไว้เป็น background process แล้วส่ง
+// แต่ละบรรทัดที่พิมพ์ออกมาเข้า channel ทันทีที่มีอะไรเปลี่ยนแปลงในระบบเสียง (sink-input
+// ใหม่/เปลี่ยน/หาย, sink ใหม่, ฯลฯ) แทนการต้อง poll ด้วย ticker เป็นระยะๆ
+//
+// (Part 1: ยังเป็นแค่ raw event string ดิบๆ ไม่ได้กรอง/แปลงอะไร — เอาไว้ทดสอบว่า
+// อ่าน event ได้จริงก่อน ค่อยกรองในขั้นถัดไป)
+//
+// ปิดการฟังได้ด้วยการ cancel ctx ที่ส่งเข้ามา
+func subscribeAudioEvents(ctx context.Context) (<-chan string, error) {
+	cmd := exec.CommandContext(ctx, "pactl", "subscribe")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("เปิด stdout ของ pactl subscribe ไม่สำเร็จ: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("เรียก pactl subscribe ไม่สำเร็จ: %w", err)
+	}
+
+	out := make(chan string, 32)
+	go func() {
+		defer close(out)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			select {
+			case out <- line:
+			case <-ctx.Done():
+				return
+			}
+		}
+		_ = cmd.Wait()
+	}()
+	return out, nil
 }
 
 // getSinkIndex หา index ตัวเลขของ sink จากชื่อ (จาก `pactl list sinks short`)
