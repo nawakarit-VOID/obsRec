@@ -532,13 +532,31 @@ func (a *App) clearApproved() {
 	a.approvedMu.Unlock()
 }
 
-// startOBSGuard เริ่ม loop เฝ้าตลอดช่วงอัด คอยเช็คว่ามี stream แปลกปลอมที่ไม่ได้รับ
+// startOBSGuard เริ่มเฝ้าตลอดช่วงอัด คอยเช็คว่ามี stream แปลกปลอมที่ไม่ได้รับ
 // อนุญาตหลุดเข้า OBS_Record มาเองมั้ย (เช่นจาก PipeWire auto-restore) ถ้าเจอจะดีดออกทันที
+//
+// Part 3: เปลี่ยนจาก ticker ถี่ๆ (poll ทุก 1.2 วิ) เป็น event-driven — ฟัง
+// pactl subscribe แล้วเช็คทันทีที่มี sink-input เปลี่ยนแปลงจริง แทบไม่มี delay
+// และไม่กิน CPU เปล่าๆ ตอนไม่มีอะไรเกิดขึ้น ยังคง ticker สำรองความถี่ต่ำ (5 วิ) ไว้
+// เผื่อ event หลุดหรือ pactl subscribe ตายกลางคัน
 func (a *App) startOBSGuard() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.guardCancel = cancel
+
+	events, err := subscribeSinkInputEvents(ctx)
+	if err != nil {
+		a.appendLog("guard: เปิดฟัง event ไม่สำเร็จ จะใช้ fallback ticker อย่างเดียว: %v", err)
+	} else {
+		go func() {
+			for range events {
+				a.guardTick()
+			}
+		}()
+	}
+
+	// fallback ticker ความถี่ต่ำ กันพลาดกรณี event หลุดหรือ subscribe ตายกลางคัน
 	go func() {
-		ticker := time.NewTicker(1200 * time.Millisecond)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -549,6 +567,9 @@ func (a *App) startOBSGuard() {
 			}
 		}
 	}()
+
+	// เช็ครอบแรกทันทีตอนเริ่ม guard เผื่อมีอะไรค้างอยู่ก่อนแล้ว
+	a.guardTick()
 }
 
 func (a *App) stopOBSGuard() {
