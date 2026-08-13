@@ -54,8 +54,6 @@ type App struct {
 
 	approvedMu  sync.Mutex
 	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
-
-	testSubCancel context.CancelFunc // ปุ่มทดสอบ Part 1 ชั่วคราว ไว้ลบทิ้งตอน Part 3
 }
 
 func main() {
@@ -120,7 +118,6 @@ func (a *App) buildUI() {
 	// ==== ส่วน audio routing ====
 	a.sourcesBox = container.NewVBox()
 	scanBtn := widget.NewButton("สแกนแหล่งเสียง", a.scan)
-	testSubBtn := widget.NewButton("🧪 ทดสอบฟัง event (Part 1)", a.onTestSubscribeToggled)
 
 	content := container.NewVBox(
 		connBox,
@@ -136,7 +133,6 @@ func (a *App) buildUI() {
 		widget.NewSeparator(),
 		widget.NewLabel("Audio routing (คลิกที่ชิปเพื่อเชื่อม/ยกเลิก):"),
 		scanBtn,
-		testSubBtn,
 		a.sourcesBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Log:"),
@@ -259,36 +255,6 @@ func (a *App) refreshPresets() {
 		a.presetsBox.Add(row)
 	}
 	a.presetsBox.Refresh()
-}
-
-// onTestSubscribeToggled ปุ่มทดสอบชั่วคราวสำหรับ Part 1 — เปิด/ปิดการฟัง event ดิบ
-// จาก pactl subscribe แล้วปริ้นลง log ให้ดูว่าอ่าน event ได้จริงมั้ย ก่อนจะเอาไปต่อกับ
-// guard/pipWatch จริงใน Part 3-4
-func (a *App) onTestSubscribeToggled() {
-	if a.testSubCancel != nil {
-		a.testSubCancel()
-		a.testSubCancel = nil
-		a.appendLog("🧪 หยุดฟัง event ทดสอบแล้ว")
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.testSubCancel = cancel
-
-	events, err := subscribeSinkInputEvents(ctx)
-	if err != nil {
-		a.appendLog("🧪 เปิดฟัง event ไม่สำเร็จ: %v", err)
-		a.testSubCancel = nil
-		cancel()
-		return
-	}
-	a.appendLog("🧪 เริ่มฟัง event แล้ว (กรองเหลือเฉพาะ sink-input) — ลองเปิด/ปิดวิดีโอเล่นดูจะเห็น event ขึ้นที่นี่")
-
-	go func() {
-		for ev := range events {
-			a.appendLog("🧪 event: %s sink-input #%d", ev.Kind, ev.Index)
-		}
-	}()
 }
 
 // ==== Audio routing ====
@@ -522,9 +488,17 @@ func (a *App) startAudioMonitoring() {
 	if err != nil {
 		a.appendLog("audio monitoring: เปิดฟัง event ไม่สำเร็จ จะใช้ fallback ticker อย่างเดียว: %v", err)
 	} else {
+		// Part 5: debounce — ถ้า event มาถี่ๆ ติดกัน (เช่นหลาย stream เปลี่ยนพร้อมกัน)
+		// จะยุบเหลือ dispatch แค่ครั้งเดียวหลังเงียบไป 200ms แทนที่จะยิง pactl list
+		// รัวๆ ทุก event เพิ่ม latency นิดหน่อย (สูงสุด 200ms) แลกกับ CPU ที่ประหยัดกว่ามาก
 		go func() {
+			var debounce *time.Timer
 			for range events {
-				dispatch()
+				if debounce == nil {
+					debounce = time.AfterFunc(200*time.Millisecond, dispatch)
+				} else {
+					debounce.Reset(200 * time.Millisecond)
+				}
 			}
 		}()
 	}
