@@ -49,12 +49,11 @@ type App struct {
 	stopRequested chan struct{}
 	recording     bool
 
-	pipWatchCancel context.CancelFunc
-	pipMatched     bool // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
+	audioCancel context.CancelFunc // ตัวเดียวคุมทั้ง guard + pipWatch (ใช้ subscribe ร่วมกัน)
+	pipMatched  bool               // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
 
 	approvedMu  sync.Mutex
 	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
-	guardCancel context.CancelFunc
 
 	testSubCancel context.CancelFunc // ปุ่มทดสอบ Part 1 ชั่วคราว ไว้ลบทิ้งตอน Part 3
 }
@@ -392,49 +391,8 @@ func (a *App) disconnectAllFromOBS() {
 }
 
 // ==== ตรวจจับเสียงแรกหลังกด Record (baseline-diff auto-connect) ====
-
-// startPiPAutoWatch จด baseline ของ stream ที่มีอยู่ตอนนี้ (ก่อนกดเล่นวิดีโอ) แล้วเริ่ม
-// poll หา stream ใหม่ที่โผล่ขึ้นมาทีหลัง เพื่อจับให้ได้ว่าอันไหนคือ PiP ที่เพิ่งเล่น
-// โดยไม่ไปยุ่งกับ stream อื่นที่เล่นอยู่ก่อนแล้ว (กันดึงเสียงจาก Firefox หน้าต่างอื่นผิดตัว)
-func (a *App) startPiPAutoWatch() {
-	_, inputs, err := a.loadAudioState()
-	if err != nil {
-		a.appendLog("เริ่ม auto-watch ไม่สำเร็จ: %v", err)
-		return
-	}
-	baseline := make(map[int]bool, len(inputs))
-	for _, si := range inputs {
-		baseline[si.ID] = true
-	}
-	a.pipMatched = false
-	a.appendLog("เริ่มเฝ้าหา PiP อัตโนมัติ (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.pipWatchCancel = cancel
-	go a.pipWatchLoop(ctx, baseline)
-}
-
-func (a *App) stopPiPAutoWatch() {
-	if a.pipWatchCancel != nil {
-		a.pipWatchCancel()
-		a.pipWatchCancel = nil
-	}
-}
-
-func (a *App) pipWatchLoop(ctx context.Context, baseline map[int]bool) {
-	ticker := time.NewTicker(1500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if a.pipWatchTick(baseline) {
-				return // เจอแล้ว เชื่อมสำเร็จ ไม่ต้องเฝ้าต่อ
-			}
-		}
-	}
-}
+// Part 4: รวมเข้ากับ guard ให้ใช้ pactl subscribe ตัวเดียวกัน ไม่ต้องเปิด
+// 2 process แยกกันแล้ว ดูฟังก์ชัน startAudioMonitoring ด้านล่าง
 
 // pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
 func (a *App) pipWatchTick(baseline map[int]bool) bool {
@@ -532,24 +490,41 @@ func (a *App) clearApproved() {
 	a.approvedMu.Unlock()
 }
 
-// startOBSGuard เริ่มเฝ้าตลอดช่วงอัด คอยเช็คว่ามี stream แปลกปลอมที่ไม่ได้รับ
-// อนุญาตหลุดเข้า OBS_Record มาเองมั้ย (เช่นจาก PipeWire auto-restore) ถ้าเจอจะดีดออกทันที
-//
-// Part 3: เปลี่ยนจาก ticker ถี่ๆ (poll ทุก 1.2 วิ) เป็น event-driven — ฟัง
-// pactl subscribe แล้วเช็คทันทีที่มี sink-input เปลี่ยนแปลงจริง แทบไม่มี delay
-// และไม่กิน CPU เปล่าๆ ตอนไม่มีอะไรเกิดขึ้น ยังคง ticker สำรองความถี่ต่ำ (5 วิ) ไว้
-// เผื่อ event หลุดหรือ pactl subscribe ตายกลางคัน
-func (a *App) startOBSGuard() {
+// startAudioMonitoring เริ่มเฝ้าตลอดช่วงอัด — รวม guard (ดีด stream ที่ไม่ได้รับ
+// อนุญาต) กับ pipWatch (จับ PiP ตัวแรกอัตโนมัติ) เข้าด้วยกัน ใช้ pactl subscribe
+// ตัวเดียว (Part 4) แทนที่จะเปิด 2 process แยกกันเหมือนก่อนหน้านี้ ลดภาระระบบลง
+func (a *App) startAudioMonitoring() {
+	// จด baseline ของ stream ที่มีอยู่ก่อนกด Record ไว้ก่อน (ไว้ให้ pipWatch ใช้แยกว่า
+	// stream ไหน "ใหม่" หลังจากนี้ ไม่ไปยุ่งกับตัวที่เล่นอยู่ก่อนแล้ว)
+	_, inputs, err := a.loadAudioState()
+	if err != nil {
+		a.appendLog("เริ่ม audio monitoring ไม่สำเร็จ: %v", err)
+		return
+	}
+	baseline := make(map[int]bool, len(inputs))
+	for _, si := range inputs {
+		baseline[si.ID] = true
+	}
+	a.pipMatched = false
+	a.appendLog("เริ่มเฝ้าเสียง (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
+
 	ctx, cancel := context.WithCancel(context.Background())
-	a.guardCancel = cancel
+	a.audioCancel = cancel
+
+	dispatch := func() {
+		a.guardTick()
+		if !a.pipMatched {
+			a.pipWatchTick(baseline)
+		}
+	}
 
 	events, err := subscribeSinkInputEvents(ctx)
 	if err != nil {
-		a.appendLog("guard: เปิดฟัง event ไม่สำเร็จ จะใช้ fallback ticker อย่างเดียว: %v", err)
+		a.appendLog("audio monitoring: เปิดฟัง event ไม่สำเร็จ จะใช้ fallback ticker อย่างเดียว: %v", err)
 	} else {
 		go func() {
 			for range events {
-				a.guardTick()
+				dispatch()
 			}
 		}()
 	}
@@ -563,19 +538,19 @@ func (a *App) startOBSGuard() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.guardTick()
+				dispatch()
 			}
 		}
 	}()
 
-	// เช็ครอบแรกทันทีตอนเริ่ม guard เผื่อมีอะไรค้างอยู่ก่อนแล้ว
-	a.guardTick()
+	// เช็ครอบแรกทันทีตอนเริ่ม เผื่อมีอะไรค้างอยู่ก่อนแล้ว
+	dispatch()
 }
 
-func (a *App) stopOBSGuard() {
-	if a.guardCancel != nil {
-		a.guardCancel()
-		a.guardCancel = nil
+func (a *App) stopAudioMonitoring() {
+	if a.audioCancel != nil {
+		a.audioCancel()
+		a.audioCancel = nil
 	}
 }
 
@@ -640,8 +615,7 @@ func (a *App) onRecordPressed() {
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
 
-	a.startPiPAutoWatch()
-	a.startOBSGuard()
+	a.startAudioMonitoring()
 
 	go a.runRecordingFlow(dur)
 }
@@ -684,9 +658,8 @@ func (a *App) finishRecording(reason string) {
 		}
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
-	a.stopPiPAutoWatch()
+	a.stopAudioMonitoring()
 	a.pipMatched = false
-	a.stopOBSGuard()
 	a.clearApproved()
 	a.disconnectAllFromOBS()
 
