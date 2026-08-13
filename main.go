@@ -276,18 +276,18 @@ func (a *App) onTestSubscribeToggled() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.testSubCancel = cancel
 
-	events, err := subscribeAudioEvents(ctx)
+	events, err := subscribeSinkInputEvents(ctx)
 	if err != nil {
 		a.appendLog("🧪 เปิดฟัง event ไม่สำเร็จ: %v", err)
 		a.testSubCancel = nil
 		cancel()
 		return
 	}
-	a.appendLog("🧪 เริ่มฟัง event แล้ว (ลองเปิด/ปิดวิดีโอเล่นดูจะเห็น event ขึ้นที่นี่)")
+	a.appendLog("🧪 เริ่มฟัง event แล้ว (กรองเหลือเฉพาะ sink-input) — ลองเปิด/ปิดวิดีโอเล่นดูจะเห็น event ขึ้นที่นี่")
 
 	go func() {
-		for line := range events {
-			a.appendLog("🧪 event: %s", line)
+		for ev := range events {
+			a.appendLog("🧪 event: %s sink-input #%d", ev.Kind, ev.Index)
 		}
 	}()
 }

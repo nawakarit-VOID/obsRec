@@ -88,6 +88,56 @@ func subscribeAudioEvents(ctx context.Context) (<-chan string, error) {
 	return out, nil
 }
 
+// AudioEvent คือ event ที่แปลงจากบรรทัดดิบของ pactl subscribe แล้ว
+// Kind: "new" | "change" | "remove"
+// Category: ประเภทของ object เช่น "sink-input", "sink", "client" ฯลฯ
+type AudioEvent struct {
+	Kind     string
+	Category string
+	Index    int
+}
+
+// รูปแบบบรรทัดของ pactl subscribe: Event 'change' on sink-input #45
+var eventLineRe = regexp.MustCompile(`^Event '(\w+)' on ([\w-]+) #(\d+)`)
+
+func parseAudioEventLine(line string) (AudioEvent, bool) {
+	m := eventLineRe.FindStringSubmatch(strings.TrimSpace(line))
+	if m == nil {
+		return AudioEvent{}, false
+	}
+	idx, err := strconv.Atoi(m[3])
+	if err != nil {
+		return AudioEvent{}, false
+	}
+	return AudioEvent{Kind: m[1], Category: m[2], Index: idx}, true
+}
+
+// subscribeSinkInputEvents ห่อ subscribeAudioEvents อีกชั้น กรองเหลือเฉพาะ event ที่
+// เกี่ยวกับ sink-input เท่านั้น (new/change/remove) — ตัดพวก client, sink, source
+// เปลี่ยนแปลงทิ้งไป เพราะ guard/pipWatch ของเราสนใจแค่ sink-input
+func subscribeSinkInputEvents(ctx context.Context) (<-chan AudioEvent, error) {
+	raw, err := subscribeAudioEvents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan AudioEvent, 32)
+	go func() {
+		defer close(out)
+		for line := range raw {
+			ev, ok := parseAudioEventLine(line)
+			if !ok || ev.Category != "sink-input" {
+				continue
+			}
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
 // getSinkIndex หา index ตัวเลขของ sink จากชื่อ (จาก `pactl list sinks short`)
 func getSinkIndex(name string) (int, error) {
 	out, err := runCmd("pactl", "list", "sinks", "short")
