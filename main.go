@@ -67,7 +67,7 @@ func main() {
 	myApp.buildUI()
 	myApp.tryAutoConnect()
 
-	w.Resize(fyne.NewSize(420, 600))
+	w.Resize(fyne.NewSize(420, 780))
 	w.ShowAndRun()
 }
 
@@ -105,7 +105,7 @@ func (a *App) buildUI() {
 
 	a.logBox = widget.NewMultiLineEntry()
 	a.logBox.Wrapping = fyne.TextWrapWord
-	a.logBox.SetMinRowsVisible(6)
+	a.logBox.SetMinRowsVisible(11)
 
 	a.recordBtn = widget.NewButton("Record", a.onRecordPressed)
 	a.stopBtn = widget.NewButton("หยุดเอง", a.onStopPressed)
@@ -136,9 +136,9 @@ func (a *App) buildUI() {
 		a.sourcesBox,
 		widget.NewSeparator(),
 		widget.NewLabel("Log:"),
-		container.NewScroll(a.logBox),
+		a.logBox,
 	)
-	a.window.SetContent(content)
+	a.window.SetContent(container.NewScroll(content))
 
 	a.refreshPresets()
 }
