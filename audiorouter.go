@@ -28,6 +28,10 @@ type SinkInput struct {
 // DisplayLabel รวม property ที่น่าจะบอกได้ว่าเป็นแหล่งเสียงไหน
 // ลำดับความสำคัญ: media.title > media.name (ถ้า Firefox/แอปไม่ส่งชื่อแท็บมา
 // จะเหลือแค่ "Playback" เฉยๆ ซึ่งเป็นข้อจำกัดของแอปนั้น ไม่ใช่บั๊กโปรแกรม)
+// maxDisplayTitleLen จำกัดความยาวชื่อ media title ที่จะโชว์บนปุ่ม กันปุ่มยาวจนดัน
+// ขนาดหน้าต่าง ชื่อที่ยาวเกินจะถูกตัดแล้วเติม "…" ต่อท้าย
+const maxDisplayTitleLen = 28
+
 func (si SinkInput) DisplayLabel() string {
 	appName := si.Props["application.name"]
 	if appName == "" {
@@ -37,15 +41,23 @@ func (si SinkInput) DisplayLabel() string {
 	if title == "" {
 		title = si.Props["media.name"]
 	}
+	title = truncateRunes(title, maxDisplayTitleLen)
 
 	label := appName
 	if title != "" && title != appName {
 		label = fmt.Sprintf("%s — %s", appName, title)
 	}
-	if pid := si.Props["application.process.id"]; pid != "" {
-		label = fmt.Sprintf("%s [pid %s]", label, pid)
-	}
 	return label
+}
+
+// truncateRunes ตัด string ให้ไม่เกิน n ตัวอักษร (นับเป็น rune กันตัดกลาง unicode)
+// ถ้ายาวเกินจะเติม "…" ต่อท้ายแทนส่วนที่ตัดออก
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func runCmd(name string, args ...string) (string, error) {
