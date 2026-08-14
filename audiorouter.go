@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -82,6 +83,10 @@ func subscribeAudioEvents(ctx context.Context) (<-chan string, error) {
 			case <-ctx.Done():
 				return
 			}
+		}
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			// ctx.Err() == nil แปลว่าไม่ได้ตั้งใจ cancel เอง แต่ scanner พังกลางคันจริงๆ
+			log.Printf("pactl subscribe: อ่าน event ผิดพลาดกลางคัน: %v", err)
 		}
 		_ = cmd.Wait()
 	}()
