@@ -18,20 +18,24 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/zalando/go-keyring"
 )
 
 const (
 	presetsPrefKey  = "saved_times"
 	hostPrefKey     = "obs_host"
-	passwordPrefKey = "obs_password"
+	passwordPrefKey = "obs_password" // legacy key; migrated to the OS keyring
+	keyringService  = "com.pip-recorder.app"
+	keyringUser     = "obs-websocket-password"
 
 	defaultOBSHost = "localhost:4455"
 )
 
 type App struct {
-	fyneApp fyne.App
-	window  fyne.Window
-	obs     *OBSController
+	fyneApp            fyne.App
+	window             fyne.Window
+	obs                *OBSController
+	passwordStorageErr error
 
 	hostEntry     *widget.Entry
 	passwordEntry *widget.Entry
@@ -75,7 +79,8 @@ func main() {
 func (a *App) buildUI() {
 	// ==== ส่วนเชื่อมต่อ OBS ====
 	savedHost := a.fyneApp.Preferences().StringWithFallback(hostPrefKey, defaultOBSHost)
-	savedPassword := a.fyneApp.Preferences().String(passwordPrefKey)
+	savedPassword, passwordErr := loadOBSPassword(a.fyneApp.Preferences())
+	a.passwordStorageErr = passwordErr
 
 	a.hostEntry = widget.NewEntry()
 	a.hostEntry.SetText(savedHost)
@@ -86,6 +91,9 @@ func (a *App) buildUI() {
 	a.passwordEntry.SetPlaceHolder("OBS WebSocket password")
 
 	a.connStatus = widget.NewLabel("ยังไม่ได้เชื่อมต่อ OBS")
+	if passwordErr != nil {
+		a.connStatus.SetText("ระบบ keyring ใช้งานไม่ได้ กรุณาตรวจสอบก่อนเชื่อมต่อ")
+	}
 	a.connectBtn = widget.NewButton("เชื่อมต่อ OBS", a.onConnectPressed)
 
 	connBox := container.NewVBox(
@@ -151,9 +159,34 @@ func (a *App) appendLog(format string, args ...interface{}) {
 	})
 }
 
+func loadOBSPassword(preferences fyne.Preferences) (string, error) {
+	password, err := keyring.Get(keyringService, keyringUser)
+	if err == nil {
+		preferences.RemoveValue(passwordPrefKey)
+		return password, nil
+	}
+	if err != keyring.ErrNotFound {
+		return "", fmt.Errorf("อ่าน OBS password จากระบบ keyring ไม่สำเร็จ: %w", err)
+	}
+
+	// Migrate passwords saved by older versions, then remove the plaintext value.
+	legacyPassword := preferences.String(passwordPrefKey)
+	if legacyPassword == "" {
+		return "", nil
+	}
+	if err := keyring.Set(keyringService, keyringUser, legacyPassword); err != nil {
+		return "", fmt.Errorf("ย้าย OBS password ไปยังระบบ keyring ไม่สำเร็จ: %w", err)
+	}
+	preferences.RemoveValue(passwordPrefKey)
+	return legacyPassword, nil
+}
+
 // ==== เชื่อมต่อ OBS ====
 
 func (a *App) tryAutoConnect() {
+	if a.passwordStorageErr != nil {
+		return
+	}
 	if strings.TrimSpace(a.hostEntry.Text) == "" {
 		return
 	}
@@ -189,9 +222,15 @@ func (a *App) connectToOBS() {
 	a.obs = obs
 	a.connStatus.SetText("เชื่อมต่อ OBS สำเร็จ (" + host + ")")
 
-	// เชื่อมต่อสำเร็จแล้วค่อยเซฟไว้ ครั้งหน้าจะได้ auto-connect ได้เลย
+	// เก็บเฉพาะ host ใน Fyne preferences; password อยู่ใน OS keyring เท่านั้น
 	a.fyneApp.Preferences().SetString(hostPrefKey, host)
-	a.fyneApp.Preferences().SetString(passwordPrefKey, password)
+	if err := keyring.Set(keyringService, keyringUser, password); err != nil {
+		a.obs.Close()
+		a.obs = nil
+		a.connStatus.SetText("เชื่อมต่อสำเร็จ แต่บันทึกรหัสผ่านไม่สำเร็จ")
+		dialog.ShowError(fmt.Errorf("เชื่อมต่อ OBS สำเร็จ แต่บันทึก password ในระบบ keyring ไม่สำเร็จ: %w", err), a.window)
+		return
+	}
 }
 
 // ==== Preset เวลา ====
