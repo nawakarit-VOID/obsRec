@@ -48,6 +48,7 @@ type App struct {
 
 	stopRequested chan struct{}
 	recording     bool
+	stateMu       sync.Mutex
 
 	audioCancel context.CancelFunc // ตัวเดียวคุมทั้ง guard + pipWatch (ใช้ subscribe ร่วมกัน)
 	pipMatched  bool               // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
@@ -361,9 +362,12 @@ func (a *App) disconnectAllFromOBS() {
 // 2 process แยกกันแล้ว ดูฟังก์ชัน startAudioMonitoring ด้านล่าง
 
 // pipWatchTick เช็ครอบเดียว คืนค่า true ถ้าเชื่อมสำเร็จแล้ว (ให้เลิก watch ต่อได้)
+
 func (a *App) pipWatchTick(baseline map[int]bool) bool {
-	// เจอและเชื่อมไปแล้วในรอบนี้ ห้ามเชื่อมอะไรเพิ่มอีกเด็ดขาด (เว้นแต่คนกดเอง)
-	if a.pipMatched {
+	a.stateMu.Lock()
+	pipMatched := a.pipMatched
+	a.stateMu.Unlock()
+	if pipMatched {
 		return true
 	}
 
@@ -412,7 +416,9 @@ func (a *App) pipWatchTick(baseline map[int]bool) bool {
 		}
 		a.appendLog("✅ ออโต้จับ PiP สำเร็จ: stream ใหม่ #%d (%s) เชื่อมกับ OBS แล้ว", target.ID, target.DisplayLabel())
 		a.approve(target.ID)
+		a.stateMu.Lock()
 		a.pipMatched = true
+		a.stateMu.Unlock()
 		a.appendLog("🔒 หยุดเฝ้าดูอัตโนมัติแล้ว หลังจากนี้จนกว่าจะกด Record รอบใหม่ จะไม่เชื่อมอะไรเพิ่มเองอีกเด็ดขาด (เชื่อมเองได้ผ่านรายการด้านล่างเท่านั้น)")
 		obsIndex2, inputs2, err := a.loadAudioState()
 		if err == nil {
@@ -471,15 +477,22 @@ func (a *App) startAudioMonitoring() {
 	for _, si := range inputs {
 		baseline[si.ID] = true
 	}
+	a.stateMu.Lock()
 	a.pipMatched = false
+	a.stateMu.Unlock()
 	a.appendLog("เริ่มเฝ้าเสียง (มี %d stream อยู่ก่อนแล้ว จะไม่แตะต้อง)", len(baseline))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	a.stateMu.Lock()
 	a.audioCancel = cancel
+	a.stateMu.Unlock()
 
 	dispatch := func() {
 		a.guardTick()
-		if !a.pipMatched {
+		a.stateMu.Lock()
+		pipMatched := a.pipMatched
+		a.stateMu.Unlock()
+		if !pipMatched {
 			a.pipWatchTick(baseline)
 		}
 	}
@@ -522,9 +535,12 @@ func (a *App) startAudioMonitoring() {
 }
 
 func (a *App) stopAudioMonitoring() {
-	if a.audioCancel != nil {
-		a.audioCancel()
-		a.audioCancel = nil
+	a.stateMu.Lock()
+	cancel := a.audioCancel
+	a.audioCancel = nil
+	a.stateMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -565,9 +581,12 @@ func (a *App) setStatus(s string) {
 }
 
 func (a *App) onRecordPressed() {
+	a.stateMu.Lock()
 	if a.recording {
+		a.stateMu.Unlock()
 		return
 	}
+	a.stateMu.Unlock()
 	dur, err := parseMMSS(a.timeEntry.Text)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("กรอกเวลาไม่ถูกต้อง (ใช้รูปแบบ mm:ss): %w", err), a.window)
@@ -578,43 +597,60 @@ func (a *App) onRecordPressed() {
 		return
 	}
 
+	stopRequested := make(chan struct{})
+	a.stateMu.Lock()
+	if a.recording {
+		a.stateMu.Unlock()
+		return
+	}
+	a.recording = true
+	a.stopRequested = stopRequested
+	a.stateMu.Unlock()
+
 	if err := a.obs.StartRecord(); err != nil {
+		a.stateMu.Lock()
+		a.recording = false
+		a.stopRequested = nil
+		a.stateMu.Unlock()
 		dialog.ShowError(err, a.window)
 		return
 	}
 
-	a.recording = true
-	a.stopRequested = make(chan struct{})
 	a.recordBtn.Disable()
 	a.stopBtn.Enable()
 	a.setStatus("เริ่มอัดแล้ว กำลังนับเวลา...")
 
 	a.startAudioMonitoring()
 
-	go a.runRecordingFlow(dur)
+	go a.runRecordingFlow(dur, stopRequested)
 }
 
 func (a *App) onStopPressed() {
-	if !a.recording {
+	a.stateMu.Lock()
+	if !a.recording || a.stopRequested == nil {
+		a.stateMu.Unlock()
 		return
 	}
-	close(a.stopRequested)
+	stopRequested := a.stopRequested
+	a.stopRequested = nil
+	a.stateMu.Unlock()
+	close(stopRequested)
 }
 
-func (a *App) runRecordingFlow(timerDur time.Duration) {
-	if a.waitTimer(timerDur) {
+func (a *App) runRecordingFlow(timerDur time.Duration, stopRequested <-chan struct{}) {
+	if a.waitTimer(timerDur, stopRequested) {
 		a.finishRecording("ครบเวลาแล้ว หยุดอัดอัตโนมัติ")
 	}
 }
 
-func (a *App) waitTimer(dur time.Duration) bool {
+func (a *App) waitTimer(dur time.Duration, stopRequested <-chan struct{}) bool {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	remaining := dur
 
 	for remaining > 0 {
 		select {
-		case <-a.stopRequested:
+		case <-stopRequested:
 			a.finishRecording("หยุดอัดด้วยตนเอง")
 			return false
 		case <-ticker.C:
@@ -626,6 +662,15 @@ func (a *App) waitTimer(dur time.Duration) bool {
 }
 
 func (a *App) finishRecording(reason string) {
+	a.stateMu.Lock()
+	if !a.recording {
+		a.stateMu.Unlock()
+		return
+	}
+	a.recording = false
+	a.stopRequested = nil
+	a.stateMu.Unlock()
+
 	if a.obs != nil {
 		if err := a.obs.StopRecord(); err != nil {
 			a.setStatus(fmt.Sprintf("หยุดอัดผิดพลาด: %v", err))
@@ -633,11 +678,12 @@ func (a *App) finishRecording(reason string) {
 	}
 	// ย้าย audio stream ที่เชื่อมกับ OBS อยู่กลับ default sink เสมอไม่ว่าจะหยุดด้วยเหตุผลไหน
 	a.stopAudioMonitoring()
+	a.stateMu.Lock()
 	a.pipMatched = false
+	a.stateMu.Unlock()
 	a.clearApproved()
 	a.disconnectAllFromOBS()
 
-	a.recording = false
 	fyne.Do(func() {
 		a.recordBtn.Enable()
 		a.stopBtn.Disable()
