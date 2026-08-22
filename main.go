@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"sort"
 	"strconv"
@@ -61,8 +62,14 @@ type App struct {
 	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
 }
 
+//go:embed assets/font/Itim-Regular.ttf
+var fontItim []byte
+var myFont = fyne.NewStaticResource("Itim-Regular.ttf", fontItim)
+
 func main() {
-	a := app.NewWithID("com.pip-recorder.app")
+	a := app.NewWithID("com.nawakarit.obsRec")
+	a.Settings().SetTheme(&MyTheme{})
+
 	w := a.NewWindow("PiP Recorder")
 
 	myApp := &App{

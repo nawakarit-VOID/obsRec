@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	fyne.io/fyne/v2 v2.8.0
 	github.com/andreykaipov/goobs v1.9.0
+	github.com/zalando/go-keyring v0.2.6
 )
 
 require (
@@ -46,7 +47,6 @@ require (
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
-	github.com/zalando/go-keyring v0.2.6 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
