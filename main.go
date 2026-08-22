@@ -53,6 +53,7 @@ type App struct {
 
 	stopRequested chan struct{}
 	recording     bool
+	finishing     bool
 	stateMu       sync.Mutex
 
 	audioCancel context.CancelFunc // ตัวเดียวคุมทั้ง guard + pipWatch (ใช้ subscribe ร่วมกัน)
@@ -650,12 +651,14 @@ func (a *App) onRecordPressed() {
 		return
 	}
 	a.recording = true
+	a.finishing = false
 	a.stopRequested = stopRequested
 	a.stateMu.Unlock()
 
 	if err := a.obs.StartRecord(); err != nil {
 		a.stateMu.Lock()
 		a.recording = false
+		a.finishing = false
 		a.stopRequested = nil
 		a.stateMu.Unlock()
 		dialog.ShowError(err, a.window)
@@ -709,11 +712,11 @@ func (a *App) waitTimer(dur time.Duration, stopRequested <-chan struct{}) bool {
 
 func (a *App) finishRecording(reason string) {
 	a.stateMu.Lock()
-	if !a.recording {
+	if !a.recording || a.finishing {
 		a.stateMu.Unlock()
 		return
 	}
-	a.recording = false
+	a.finishing = true
 	a.stopRequested = nil
 	a.stateMu.Unlock()
 
@@ -729,6 +732,11 @@ func (a *App) finishRecording(reason string) {
 	a.stateMu.Unlock()
 	a.clearApproved()
 	a.disconnectAllFromOBS()
+
+	a.stateMu.Lock()
+	a.recording = false
+	a.finishing = false
+	a.stateMu.Unlock()
 
 	fyne.Do(func() {
 		a.recordBtn.Enable()
