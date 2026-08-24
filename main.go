@@ -795,11 +795,21 @@ func parseMMSS(s string) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
+	if mm < 0 {
+		return 0, fmt.Errorf("นาทีต้องไม่ติดลบ")
+	}
 	ss, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return 0, err
 	}
-	return time.Duration(mm)*time.Minute + time.Duration(ss)*time.Second, nil
+	if ss < 0 || ss > 59 {
+		return 0, fmt.Errorf("วินาทีต้องอยู่ระหว่าง 0-59")
+	}
+	duration := time.Duration(mm)*time.Minute + time.Duration(ss)*time.Second
+	if duration <= 0 {
+		return 0, fmt.Errorf("ระยะเวลาต้องมากกว่า 0")
+	}
+	return duration, nil
 }
 
 func formatDuration(d time.Duration) string {
