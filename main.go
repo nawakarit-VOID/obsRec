@@ -57,7 +57,8 @@ type App struct {
 	stateMu       sync.Mutex
 
 	audioCancel context.CancelFunc // ตัวเดียวคุมทั้ง guard + pipWatch (ใช้ subscribe ร่วมกัน)
-	pipMatched  bool               // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
+	audioWG     sync.WaitGroup
+	pipMatched  bool // true = เจอและเชื่อม PiP ของรอบนี้แล้ว ห้ามเชื่อมอะไรอัตโนมัติอีกจนกว่าจะกด Record รอบใหม่
 
 	approvedMu  sync.Mutex
 	approvedIDs map[int]bool // stream ที่ "ได้รับอนุญาต" ให้อยู่ใน OBS_Record (คนกดเชื่อมเอง)
@@ -535,6 +536,11 @@ func (a *App) startAudioMonitoring() {
 	a.stateMu.Unlock()
 
 	dispatch := func() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		a.guardTick()
 		a.stateMu.Lock()
 		pipMatched := a.pipMatched
@@ -551,20 +557,54 @@ func (a *App) startAudioMonitoring() {
 		// Part 5: debounce — ถ้า event มาถี่ๆ ติดกัน (เช่นหลาย stream เปลี่ยนพร้อมกัน)
 		// จะยุบเหลือ dispatch แค่ครั้งเดียวหลังเงียบไป 200ms แทนที่จะยิง pactl list
 		// รัวๆ ทุก event เพิ่ม latency นิดหน่อย (สูงสุด 200ms) แลกกับ CPU ที่ประหยัดกว่ามาก
+		a.audioWG.Add(1)
 		go func() {
-			var debounce *time.Timer
-			for range events {
-				if debounce == nil {
-					debounce = time.AfterFunc(200*time.Millisecond, dispatch)
-				} else {
+			defer a.audioWG.Done()
+			debounce := time.NewTimer(time.Hour)
+			if !debounce.Stop() {
+				<-debounce.C
+			}
+			var debounceC <-chan time.Time
+			for {
+				select {
+				case <-ctx.Done():
+					if !debounce.Stop() && debounceC != nil {
+						select {
+						case <-debounce.C:
+						default:
+						}
+					}
+					return
+				case _, ok := <-events:
+					if !ok {
+						debounce.Stop()
+						return
+					}
+					if !debounce.Stop() && debounceC != nil {
+						select {
+						case <-debounce.C:
+						default:
+						}
+					}
 					debounce.Reset(200 * time.Millisecond)
+					debounceC = debounce.C
+				case <-debounceC:
+					debounceC = nil
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					dispatch()
 				}
 			}
 		}()
 	}
 
 	// fallback ticker ความถี่ต่ำ กันพลาดกรณี event หลุดหรือ subscribe ตายกลางคัน
+	a.audioWG.Add(1)
 	go func() {
+		defer a.audioWG.Done()
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -589,6 +629,7 @@ func (a *App) stopAudioMonitoring() {
 	if cancel != nil {
 		cancel()
 	}
+	a.audioWG.Wait()
 }
 
 func (a *App) guardTick() {
