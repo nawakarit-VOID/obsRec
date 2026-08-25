@@ -7,6 +7,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ type App struct {
 	window             fyne.Window
 	obs                *OBSController
 	passwordStorageErr error
+	startupErrors      []error
 
 	hostEntry     *widget.Entry
 	passwordEntry *widget.Entry
@@ -78,11 +80,53 @@ func main() {
 		fyneApp: a,
 		window:  w,
 	}
+	myApp.startupErrors = preflightExternalDependencies()
 	myApp.buildUI()
-	myApp.tryAutoConnect()
+	myApp.showStartupErrors()
+	if len(myApp.startupErrors) == 0 {
+		myApp.tryAutoConnect()
+	}
 
 	w.Resize(fyne.NewSize(420, 780))
 	w.ShowAndRun()
+}
+
+func preflightExternalDependencies() []error {
+	checks := []struct {
+		name    string
+		args    []string
+		purpose string
+	}{
+		{name: "pactl", args: []string{"info"}, purpose: "เชื่อมต่อระบบเสียง PulseAudio/PipeWire"},
+		{name: "wmctrl", args: []string{"-m"}, purpose: "ค้นหาหน้าต่าง Picture-in-Picture"},
+		{name: "xdotool", args: []string{"getdisplaygeometry"}, purpose: "อ่าน process ID ของหน้าต่าง PiP"},
+	}
+
+	var errors []error
+	for _, check := range checks {
+		if _, err := exec.LookPath(check.name); err != nil {
+			errors = append(errors, fmt.Errorf("ไม่พบ %s: ติดตั้งโปรแกรมนี้เพื่อ%s", check.name, check.purpose))
+			continue
+		}
+		if _, err := runCmd(check.name, check.args...); err != nil {
+			errors = append(errors, fmt.Errorf("%s ยังใช้งานไม่ได้สำหรับ%s: %v", check.name, check.purpose, err))
+		}
+	}
+	return errors
+}
+
+func (a *App) showStartupErrors() {
+	if len(a.startupErrors) == 0 {
+		return
+	}
+	var message strings.Builder
+	message.WriteString("โปรแกรมยังไม่พร้อมใช้งาน:\n\n")
+	for _, err := range a.startupErrors {
+		message.WriteString("• ")
+		message.WriteString(err.Error())
+		message.WriteByte('\n')
+	}
+	dialog.ShowInformation("ตรวจสอบระบบไม่ผ่าน", message.String(), a.window)
 }
 
 func (a *App) buildUI() {
